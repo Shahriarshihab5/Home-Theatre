@@ -1,0 +1,178 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    font-size: 16px;
+    /* TV boxes repaint badly with smooth scrolling — keep navigation instant. */
+    scroll-behavior: auto;
+  }
+  @media (min-width: 1500px) {
+    html {
+      font-size: 17px;
+    }
+  }
+  @media (min-width: 1900px) {
+    html {
+      font-size: 19px;
+    }
+  }
+  @media (min-width: 2400px) {
+    html {
+      font-size: 22px;
+    }
+  }
+
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+
+  body {
+    @apply bg-ink text-white font-sans antialiased;
+    background-image:
+      radial-gradient(1200px 600px at 15% -10%, rgba(239, 68, 68, 0.12), transparent 60%),
+      radial-gradient(900px 500px at 100% 0%, rgba(245, 182, 66, 0.07), transparent 55%),
+      radial-gradient(800px 600px at 50% 120%, rgba(120, 50, 200, 0.08), transparent 60%);
+    /* `fixed` forces a full-screen repaint on every scroll frame — brutal on TVs. */
+    background-attachment: scroll;
+  }
+
+  /* While a video plays, drop every decorative paint cost we control. */
+  body.video-playing {
+    background-image: none;
+    background-color: #000;
+  }
+  body.video-playing *,
+  body.video-playing *::before,
+  body.video-playing *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+
+  ::selection {
+    background: rgba(239, 68, 68, 0.45);
+  }
+}
+
+@layer components {
+  .no-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .card-surface {
+    @apply bg-panel ring-1 ring-white/10;
+  }
+
+  /* Rows below the fold skip layout/paint until they scroll into view. */
+  .row-section {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 280px;
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-medium text-white/75 transition
+      hover:border-white/25 hover:bg-white/[0.08] hover:text-white;
+  }
+
+  .btn {
+    @apply inline-flex select-none items-center justify-center gap-2 rounded-xl px-5 py-2.5 text-[0.95rem] font-semibold transition
+      disabled:cursor-not-allowed disabled:opacity-40;
+  }
+  .btn-primary {
+    @apply inline-flex select-none items-center justify-center gap-2 rounded-xl bg-brand px-5 py-2.5 text-[0.95rem] font-semibold text-white
+      shadow-lg shadow-brand/25 transition hover:bg-brand-soft disabled:cursor-not-allowed disabled:opacity-40;
+  }
+  .btn-soft {
+    @apply inline-flex select-none items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.06] px-5 py-2.5
+      text-[0.95rem] font-semibold text-white/85 transition hover:border-white/25 hover:bg-white/[0.1]
+      disabled:cursor-not-allowed disabled:opacity-40;
+  }
+  .btn-ghost {
+    @apply inline-flex select-none items-center justify-center gap-2 rounded-xl px-5 py-2.5 text-[0.95rem] font-semibold
+      text-white/65 transition hover:bg-white/[0.06] hover:text-white disabled:cursor-not-allowed disabled:opacity-40;
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[0.65rem] font-bold uppercase tracking-wide;
+  }
+}
+
+/* Strong, TV-friendly focus states (always visible for D-pad users) */
+[data-nav]:focus {
+  outline: none;
+}
+[data-nav]:focus-visible,
+.tv-focusable:focus {
+  outline: none;
+}
+
+.focus-ring:focus {
+  outline: 3px solid theme('colors.gold');
+  outline-offset: 3px;
+}
+
+button[data-nav]:focus,
+a[data-nav]:focus,
+[role='button'][data-nav]:focus {
+  outline: 3px solid theme('colors.gold');
+  outline-offset: 3px;
+  border-radius: 0.9rem;
+}
+
+input[data-nav]:focus,
+textarea[data-nav]:focus {
+  outline: 2px solid theme('colors.gold');
+  outline-offset: 2px;
+  border-color: transparent;
+}
+
+.poster-btn:focus .poster-frame,
+.poster-btn:hover .poster-frame {
+  transform: scale(1.055);
+  border-color: rgba(245, 182, 66, 0.85);
+  box-shadow:
+    0 0 0 3px theme('colors.gold'),
+    0 18px 40px -12px rgba(0, 0, 0, 0.8);
+}
+
+.poster-frame {
+  transition:
+    transform 180ms ease,
+    box-shadow 180ms ease,
+    border-color 180ms ease;
+}
+
+.row-fade {
+  mask-image: linear-gradient(to right, transparent 0, black 2%, black 98%, transparent 100%);
+}
+
+/* Prevent native scroll on TV pages when modal open */
+body.modal-open {
+  overflow: hidden;
+}
+
+.shimmer {
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0.04) 25%, rgba(255, 255, 255, 0.09) 37%, rgba(255, 255, 255, 0.04) 63%);
+  background-size: 400% 100%;
+  animation: shimmer 1.4s ease infinite;
+}
+@keyframes shimmer {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: -100% 0;
+  }
+}
+
+/* Native video fills its frame on TVs */
+video::-webkit-media-controls-panel {
+  background-image: linear-gradient(transparent, rgba(0, 0, 0, 0.7));
+}
