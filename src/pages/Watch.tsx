@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { api, imgSrc, prettyTitle, streamMode } from '../lib/api'
+import { api, imgSrc, playUrl, prettyTitle, streamMode } from '../lib/api'
 import { useMemory } from '../lib/memory'
-import type { Detail } from '../types'
+import type { Detail, StreamInfo } from '../types'
 import { HindiBadge, ImdbBadge, QualityBadge } from '../components/Badges'
 import { Row } from '../components/Row'
 import { DetailModal } from '../components/DetailModal'
@@ -13,6 +13,7 @@ import {
   DownloadIcon,
   HeartIcon,
   OpenIcon,
+  PauseIcon,
   PlayIcon,
   ThumbDownIcon,
   VolumeIcon,
@@ -52,6 +53,17 @@ function describeTrack(track: AudioTrackLike, index: number) {
   return label || language || `Track ${index + 1}`
 }
 
+/** Pick the audio track the viewer expects: Hindi if the file offers it. */
+function defaultAudioOrdinal(info: StreamInfo | null): number {
+  const list = info?.info?.audio || []
+  if (!list.length) return 0
+  if (info?.filenameAudio?.hindi) {
+    const hindi = list.find((t) => t.lang === 'hin' || /hindi/i.test(t.language))
+    if (hindi) return hindi.ordinal
+  }
+  return list.find((t) => t.isDefault)?.ordinal ?? 0
+}
+
 export function WatchPage() {
   const { slug = '' } = useParams()
   const navigate = useNavigate()
@@ -64,12 +76,29 @@ export function WatchPage() {
   const [audioOpen, setAudioOpen] = useState(false)
   const [tracks, setTracks] = useState<{ label: string; enabled: boolean }[]>([])
 
+  // Browser-friendly stream state (ffmpeg remux + real audio tracks)
+  const [streamInfo, setStreamInfo] = useState<StreamInfo | null>(null)
+  const [audioOrdinal, setAudioOrdinal] = useState(0)
+  const [baseOffset, setBaseOffset] = useState(0)
+  const [streamKey, setStreamKey] = useState(0)
+  const [silent, setSilent] = useState(false)
+  // Custom timeline. The remuxed stream has no seekable index, so the browser's
+  // own progress bar only ever shows the few seconds ffmpeg has produced. We use
+  // the real duration from /api/stream-info and restart ffmpeg at the target.
+  const [position, setPosition] = useState(0)
+  const [seeking, setSeeking] = useState(false)
+  const [buffering, setBuffering] = useState(false)
+  const [paused, setPaused] = useState(false)
+
   const videoRef = useRef<HTMLVideoElement>(null)
   const boxRef = useRef<HTMLDivElement>(null)
   const lastSave = useRef(0)
   const resumeApplied = useRef(false)
   const detailRef = useRef<Detail | null>(null)
   const progressRef = useRef({ position: 0, duration: 0 })
+  const silentTimer = useRef<number | null>(null)
+  const audioPicked = useRef(false)
+  const seekTimer = useRef<number | null>(null)
 
   const history = memory.history.find((h) => h.slug === slug)
   const resumeAt = history && !history.completed ? history.positionSec : 0
@@ -80,6 +109,13 @@ export function WatchPage() {
     setError(null)
     setDetail(null)
     setVideoError(false)
+    setStreamInfo(null)
+    setSilent(false)
+    setAudioOrdinal(0)
+    setBaseOffset(0)
+    setPosition(0)
+    setSeeking(false)
+    audioPicked.current = false
     api
       .detail(slug)
       .then((d) => {
@@ -88,6 +124,15 @@ export function WatchPage() {
         detailRef.current = d
       })
       .catch((e) => !cancelled && setError(e.message))
+    api
+      .streamInfo(slug)
+      .then((info) => {
+        if (cancelled) return
+        setStreamInfo(info)
+        // Don't undo a track the viewer already picked while this was loading.
+        if (!audioPicked.current) setAudioOrdinal(defaultAudioOrdinal(info))
+      })
+      .catch(() => {})
     return () => {
       cancelled = true
     }
@@ -107,7 +152,36 @@ export function WatchPage() {
   }, [])
 
   const source = detail?.sources?.[0]?.url || ''
-  const canPlay = streamMode === 'direct' && Boolean(source)
+  const realTracks = streamInfo?.info?.audio || []
+  // ffmpeg on the server re-muxes the video and converts audio to AAC, so the
+  // browser gets sound and can switch languages.
+  const canRemux = Boolean(streamInfo?.transcode && streamInfo?.source)
+  const playingRemux = canRemux
+  const canPlay = Boolean(detail) && (playingRemux || (streamMode === 'direct' && Boolean(source)))
+  const videoSrc = playingRemux && detail
+    ? playUrl(detail.slug, audioOrdinal, baseOffset)
+    : source
+
+  const currentTrack = realTracks.find((t) => t.ordinal === audioOrdinal) || realTracks[0] || null
+  const totalDuration = streamInfo?.info?.durationSec || 0
+  const absoluteTime = () => baseOffset + (videoRef.current?.currentTime || 0)
+
+  const restartAt = useCallback((seconds: number) => {
+    setSeeking(true)
+    setPosition(Math.max(0, Math.floor(seconds)))
+    setBaseOffset(Math.max(0, Math.floor(seconds)))
+    setStreamKey((k) => k + 1)
+    setSilent(false)
+  }, [])
+
+  // Resume where the viewer stopped, once we know the saved position.
+  useEffect(() => {
+    if (resumeApplied.current) return
+    if (resumeAt > 15) {
+      resumeApplied.current = true
+      setBaseOffset(Math.floor(resumeAt))
+    }
+  }, [resumeAt])
 
   const syncAudioTracks = useCallback(() => {
     const list = getAudioTrackList(videoRef.current)
@@ -125,45 +199,70 @@ export function WatchPage() {
 
   const chooseAudio = useCallback(
     (index: number) => {
+      // Real tracks from ffmpeg: restart the remux at the same timestamp with
+      // the chosen language. Fall back to the browser's own track API.
+      if (realTracks.length > 1) {
+        audioPicked.current = true
+        restartAt(absoluteTime())
+        setAudioOrdinal(index)
+        return
+      }
       const video = videoRef.current
       const list = getAudioTrackList(video)
       if (!video || !list || !list.length) return
       const at = video.currentTime
-      for (let i = 0; i < list.length; i += 1) {
-        list[i].enabled = i === index
-      }
-      // Keep the viewer at the same moment after the audio pipeline changes.
+      for (let i = 0; i < list.length; i += 1) list[i].enabled = i === index
       video.currentTime = at
       syncAudioTracks()
     },
-    [syncAudioTracks],
+    [baseOffset, realTracks.length, restartAt, syncAudioTracks],
+  )
+
+  const togglePlay = useCallback(() => {
+    const v = videoRef.current
+    if (!v) return
+    if (v.paused) v.play().catch(() => {})
+    else v.pause()
+  }, [])
+
+  /** Preview the target immediately, then restart the stream after a pause so
+   *  dragging the bar doesn't spawn dozens of ffmpeg processes. */
+  const queueSeek = useCallback(
+    (seconds: number) => {
+      const target = Math.max(0, Math.min(totalDuration || Infinity, Math.floor(seconds)))
+      setPosition(target)
+      if (seekTimer.current) window.clearTimeout(seekTimer.current)
+      seekTimer.current = window.setTimeout(() => restartAt(target), 450)
+    },
+    [restartAt, totalDuration],
   )
 
   const onLoadedMetadata = useCallback(() => {
     const video = videoRef.current
     if (!video) return
+    setSeeking(false)
+    setPaused(video.paused)
     syncAudioTracks()
-    if (resumeApplied.current) return
-    resumeApplied.current = true
-    if (resumeAt > 15 && resumeAt < video.duration - 10) {
-      video.currentTime = resumeAt
-    }
     video.play().catch(() => {
       /* autoplay may be blocked on TVs — native controls remain usable */
     })
-  }, [resumeAt, syncAudioTracks])
+  }, [syncAudioTracks])
 
   const onTimeUpdate = useCallback(() => {
     const video = videoRef.current
     const d = detailRef.current
     if (!video || !d) return
-    progressRef.current = { position: video.currentTime, duration: video.duration || 0 }
+    const at = baseOffset + video.currentTime
+    setPosition(at)
+    setPaused(video.paused)
+    const duration = totalDuration || baseOffset + (video.duration || 0)
+    progressRef.current = { position: at, duration }
     const now = Date.now()
     if (now - lastSave.current > 5000) {
       lastSave.current = now
-      memory.saveProgress(d, video.currentTime, video.duration || 0)
+      memory.saveProgress(d, at, duration)
     }
-  }, [memory])
+  }, [baseOffset, memory, totalDuration])
 
   const onEnded = useCallback(() => {
     const d = detailRef.current
@@ -177,12 +276,31 @@ export function WatchPage() {
     else el.requestFullscreen?.().catch(() => {})
   }, [])
 
-  const seek = (delta: number) => {
-    const v = videoRef.current
-    if (!v) return
-    v.currentTime = Math.max(0, Math.min(v.duration || Infinity, v.currentTime + delta))
-    lastSave.current = 0
-  }
+  const seek = useCallback(
+    (delta: number, absolute?: number) => {
+      const v = videoRef.current
+      if (!v) return
+      const target = Math.max(
+        0,
+        Math.min(totalDuration || Infinity, absolute ?? absoluteTime() + delta),
+      )
+      if (playingRemux) restartAt(target)
+      else v.currentTime = target
+      lastSave.current = 0
+    },
+    [baseOffset, playingRemux, restartAt, totalDuration],
+  )
+
+  // Chrome silently plays AC-3/E-AC3 video with no sound. Detect that honestly.
+  const checkSilence = useCallback(() => {
+    if (silentTimer.current) window.clearTimeout(silentTimer.current)
+    silentTimer.current = window.setTimeout(() => {
+      const v = videoRef.current as (HTMLVideoElement & { webkitAudioDecodedByteCount?: number }) | null
+      if (!v || v.paused || v.muted || v.volume === 0) return
+      const decoded = v.webkitAudioDecodedByteCount
+      if (typeof decoded === 'number' && decoded === 0) setSilent(true)
+    }, 6000)
+  }, [])
 
   useEffect(() => {
     if (!canPlay) return
@@ -243,7 +361,7 @@ export function WatchPage() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [canPlay, navigate, toggleFullscreen, syncAudioTracks, audioOpen])
+  }, [canPlay, navigate, toggleFullscreen, syncAudioTracks, audioOpen, seek])
 
   if (error) {
     return (
@@ -303,29 +421,133 @@ export function WatchPage() {
           <>
             <div ref={boxRef} className="relative overflow-hidden rounded-2xl border border-white/10 bg-black shadow-2xl">
               {canPlay && !videoError ? (
-                <video
-                  ref={videoRef}
-                  src={source}
-                  poster={imgSrc(detail.thumb)}
-                  controls
-                  autoPlay
-                  playsInline
-                  preload="metadata"
-                  className="aspect-video w-full bg-black"
-                  onLoadedMetadata={onLoadedMetadata}
-                  onTimeUpdate={onTimeUpdate}
-                  onPlay={() => {
-                    document.body.classList.add('video-playing')
-                    syncAudioTracks()
-                  }}
-                  onPause={() => {
-                    document.body.classList.remove('video-playing')
-                    const v = videoRef.current
-                    if (v && detail) memory.saveProgress(detail, v.currentTime, v.duration || 0)
-                  }}
-                  onEnded={onEnded}
-                  onError={() => setVideoError(true)}
-                />
+                <>
+                  <video
+                    key={streamKey}
+                    ref={videoRef}
+                    src={videoSrc}
+                    poster={imgSrc(detail.thumb)}
+                    autoPlay
+                    playsInline
+                    preload="metadata"
+                    className="aspect-video w-full bg-black"
+                    onClick={togglePlay}
+                    onLoadedMetadata={onLoadedMetadata}
+                    onCanPlay={() => setSeeking(false)}
+                    onTimeUpdate={onTimeUpdate}
+                    onPlay={() => {
+                      setPaused(false)
+                      document.body.classList.add('video-playing')
+                      syncAudioTracks()
+                      checkSilence()
+                    }}
+                    onPause={() => {
+                      setPaused(true)
+                      document.body.classList.remove('video-playing')
+                      const v = videoRef.current
+                      if (v && detail) {
+                        memory.saveProgress(detail, baseOffset + v.currentTime, totalDuration || v.duration || 0)
+                      }
+                    }}
+                    onWaiting={() => setBuffering(true)}
+                    onPlaying={() => {
+                      setBuffering(false)
+                      setSeeking(false)
+                    }}
+                    onEnded={onEnded}
+                    onError={() => setVideoError(true)}
+                  />
+
+                  {seeking ? (
+                    <div className="pointer-events-none absolute inset-0 z-20 flex flex-col items-center justify-center gap-2.5 bg-black/65">
+                      <span className="h-10 w-10 animate-spin rounded-full border-2 border-white/15 border-t-gold" />
+                      <p className="text-sm font-semibold text-white/90">Loading from {fmt(position)}…</p>
+                      <p className="text-[0.65rem] text-white/40">Restarting the stream at the new position</p>
+                    </div>
+                  ) : buffering ? (
+                    <div className="pointer-events-none absolute right-3 top-3 z-20 flex items-center gap-2 rounded-full bg-black/65 px-2.5 py-1 text-[0.65rem] text-white/70">
+                      <span className="h-3 w-3 animate-spin rounded-full border border-white/30 border-t-white" /> Buffering
+                    </div>
+                  ) : null}
+
+                  {!seeking ? (
+                    <div className="absolute inset-x-0 bottom-0 z-10 bg-gradient-to-t from-black/95 via-black/60 to-transparent px-3 pb-2 pt-10">
+                      <input
+                        type="range"
+                        data-nav
+                        min={0}
+                        max={Math.max(1, Math.floor(totalDuration || 1))}
+                        step={60}
+                        value={Math.min(Math.floor(position), Math.max(1, Math.floor(totalDuration || 1)))}
+                        onChange={(e) => queueSeek(Number(e.target.value))}
+                        className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-white/30 accent-[#f0c96a]"
+                        aria-label="Seek through the movie"
+                      />
+                      <div className="mt-1 flex items-center gap-1 text-white/85">
+                        <button
+                          type="button"
+                          data-nav
+                          onClick={togglePlay}
+                          className="rounded-lg p-1.5 hover:bg-white/10"
+                          aria-label={paused ? 'Play' : 'Pause'}
+                        >
+                          {paused ? <PlayIcon width={18} height={18} /> : <PauseIcon width={18} height={18} />}
+                        </button>
+                        <button
+                          type="button"
+                          data-nav
+                          onClick={() => seek(-600)}
+                          className="chip !px-2 !py-1 !text-[0.65rem]"
+                        >
+                          −10 min
+                        </button>
+                        <button
+                          type="button"
+                          data-nav
+                          onClick={() => seek(600)}
+                          className="chip !px-2 !py-1 !text-[0.65rem]"
+                        >
+                          +10 min
+                        </button>
+                        <span className="ml-1 font-mono text-[0.7rem] tabular-nums text-white/70">
+                          {fmt(position)} / {fmt(totalDuration)}
+                        </span>
+                        <span className="ml-auto" />
+                        <button
+                          type="button"
+                          data-nav
+                          onClick={() => {
+                            const v = videoRef.current
+                            if (v) v.muted = !v.muted
+                          }}
+                          className="rounded-lg p-1.5 hover:bg-white/10"
+                          aria-label="Mute or unmute"
+                        >
+                          <VolumeIcon width={17} height={17} />
+                        </button>
+                        <button
+                          type="button"
+                          data-nav
+                          onClick={() => {
+                            syncAudioTracks()
+                            setAudioOpen((open) => !open)
+                          }}
+                          className="rounded-lg px-2 py-1 text-[0.65rem] font-semibold hover:bg-white/10"
+                        >
+                          Audio
+                        </button>
+                        <button
+                          type="button"
+                          data-nav
+                          onClick={toggleFullscreen}
+                          className="rounded-lg px-2 py-1 text-[0.65rem] font-semibold hover:bg-white/10"
+                        >
+                          Fullscreen
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                </>
               ) : (
                 <div className="relative flex aspect-video w-full items-center justify-center overflow-hidden bg-black">
                   {detail.thumb ? (
@@ -337,14 +559,14 @@ export function WatchPage() {
                     </div>
                     <p className="text-lg font-bold">
                       {streamMode === 'external'
-                        ? 'This page is HTTPS — CircleFTP streams are HTTP'
+                        ? 'Playback needs your home Wi-Fi'
                         : videoError
                           ? 'Your TV browser could not decode this file'
                           : 'No direct stream listed for this title'}
                     </p>
                     <p className="mt-2 text-sm leading-relaxed text-white/50">
                       {streamMode === 'external'
-                        ? 'Because browsers block HTTP video inside HTTPS pages, play opens on CircleFTP itself. For in-app playback with resume, run the app on your home network over HTTP.'
+                        ? 'This cloud copy of the app can browse the catalog and ask the AI from anywhere. Streaming needs your home Wi-Fi: open the app on the home server (http://<your-laptop-ip>:8787) to play with resume and audio switching.'
                         : videoError
                           ? 'The file may be an unsupported container/codec (often MKV). Open it on CircleFTP, or try the TV’s native video player app.'
                           : 'CircleFTP didn’t expose a source for this title. Open its page to use the site’s own player.'}
@@ -371,6 +593,45 @@ export function WatchPage() {
                 </div>
               )}
             </div>
+
+            {silent || (streamInfo?.info?.audioNeedsRemux && !playingRemux) ? (
+              <div className="mt-3 flex flex-wrap items-center gap-3 rounded-2xl border border-amber-400/30 bg-amber-400/10 p-3">
+                <VolumeIcon width={18} height={18} className="text-amber-300" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold text-amber-200">
+                    No sound? This file’s audio format isn’t supported by the browser
+                  </p>
+                  <p className="text-xs text-white/55">
+                    {streamInfo?.info?.audio?.[0]
+                      ? `The file uses ${streamInfo.info.audio[0].codecLabel}, which Chrome cannot decode. `
+                      : ''}
+                    {streamInfo?.transcode
+                      ? 'Reloading with the built-in audio converter fixes this.'
+                      : 'Open it in CircleFTP or your TV’s video player, or run the app on the home server so it can convert the audio for you.'}
+                  </p>
+                </div>
+                {streamInfo?.transcode ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const at = absoluteTime()
+                      restartAt(at)
+                    }}
+                    className="btn-primary !py-2 text-sm"
+                  >
+                    <VolumeIcon width={15} height={15} /> Fix sound
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => window.open(detail.watchUrl, '_blank', 'noopener')}
+                    className="btn-soft !py-2 text-sm"
+                  >
+                    <OpenIcon width={15} height={15} /> Open CircleFTP
+                  </button>
+                )}
+              </div>
+            ) : null}
 
             <div className="mt-5 flex flex-wrap items-center gap-2">
               {canPlay && !videoError ? (
@@ -432,9 +693,11 @@ export function WatchPage() {
                 aria-expanded={audioOpen}
               >
                 <VolumeIcon width={15} height={15} /> Audio
-                {tracks.length > 1 ? (
+                {(realTracks.length > 1 ? currentTrack?.language : tracks.find((t) => t.enabled)?.label) ? (
                   <span className="max-w-[9rem] truncate text-[0.7rem] text-white/35">
-                    {tracks.find((t) => t.enabled)?.label || ''}
+                    {realTracks.length > 1
+                      ? currentTrack?.language || currentTrack?.lang
+                      : tracks.find((t) => t.enabled)?.label || ''}
                   </span>
                 ) : null}
               </button>
@@ -442,6 +705,25 @@ export function WatchPage() {
                 <VolumeIcon width={14} height={14} /> ←/→ seek · ↑/↓ volume · Space pause · A audio
               </span>
             </div>
+
+            {playingRemux && totalDuration ? (
+              <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                <span className="text-[0.65rem] uppercase tracking-wider text-white/25">Jump to</span>
+                {[0.25, 0.5, 0.75].map((fraction) => (
+                  <button
+                    key={fraction}
+                    type="button"
+                    onClick={() => seek(0, totalDuration * fraction)}
+                    className="chip !text-[0.65rem]"
+                  >
+                    {Math.round(fraction * 100)}%
+                  </button>
+                ))}
+                <span className="text-[0.6rem] text-white/20">
+                  Streaming mode — the player reloads at the new position.
+                </span>
+              </div>
+            ) : null}
 
             {audioOpen ? (
               <div className="mt-3 rounded-2xl border border-white/10 bg-panel p-4">
@@ -452,7 +734,35 @@ export function WatchPage() {
                   </p>
                 </div>
 
-                {tracks.length > 1 ? (
+                {realTracks.length ? (
+                  <div className="mt-3 space-y-3">
+                    <div className="flex flex-wrap gap-2">
+                      {realTracks.map((track) => {
+                        const active = track.ordinal === audioOrdinal
+                        return (
+                          <button
+                            key={track.ordinal}
+                            type="button"
+                            onClick={() => chooseAudio(track.ordinal)}
+                            className={`chip !text-sm ${active ? '!border-gold !bg-gold/15 !text-gold' : ''}`}
+                          >
+                            {active ? <CheckIcon width={14} height={14} /> : null}
+                            {track.language || track.lang || `Track ${track.ordinal + 1}`}
+                            <span className="text-[0.65rem] font-normal text-white/35">
+                              {track.codecLabel}
+                              {track.channels ? ` · ${track.channels}` : ''}
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                    <p className="text-xs leading-relaxed text-white/40">
+                      These are the real audio tracks inside the file. The video is copied untouched
+                      and the track you pick is converted to AAC on the fly, so switching languages
+                      works in this browser — no VLC needed.
+                    </p>
+                  </div>
+                ) : tracks.length > 1 ? (
                   <div className="mt-3 flex flex-wrap gap-2">
                     {tracks.map((track, index) => (
                       <button
@@ -471,16 +781,15 @@ export function WatchPage() {
                 ) : (
                   <div className="mt-2 space-y-2">
                     <p className="text-sm text-white/65">
-                      {tracks.length === 1
-                        ? `The browser exposes one track: ${tracks[0].label}.`
-                        : 'This TV browser is not exposing the embedded MKV audio tracks.'}
+                      {streamInfo?.info?.audio?.length
+                        ? 'Audio conversion is not available on this server.'
+                        : 'Could not read the audio tracks of this file.'}
                     </p>
                     <p className="text-xs leading-relaxed text-white/40">
                       CircleFTP stores these as one MKV with dual audio (for example Hindi + Korean).
-                      Chrome-based TV browsers usually play only the default track and cannot switch
-                      it. If your TV browser shows a track menu in its own player, use that; otherwise
-                      open the file in VLC or CircleFTP’s player on a device that supports MKV audio
-                      tracks.
+                      Chrome-based browsers cannot decode AC-3/E-AC3 audio, so the picture plays
+                      silently. Opening it in CircleFTP or the TV’s own video player gives you the
+                      full track menu.
                     </p>
                     <div className="flex flex-wrap gap-2">
                       <button

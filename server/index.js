@@ -1,8 +1,9 @@
 import 'dotenv/config'
 import os from 'node:os'
 import app from './app.js'
-import { startWarmup } from './catalog.js'
+import { indexStats, startCrawl, startWarmup } from './catalog.js'
 import { aiMeta } from './ai.js'
+import { transcodeAvailable } from './player.js'
 
 const PORT = Number(process.env.PORT) || 8787
 
@@ -35,6 +36,8 @@ app.listen(PORT, '0.0.0.0', () => {
         : 'local ranking — add a free GEMINI_API_KEY to .env'
   console.log(`  AI:      ${aiLabel}`)
   console.log(`  TMDB:    ${process.env.TMDB_API_KEY ? 'enabled (optional metadata)' : 'disabled (using CircleFTP posters)'}`)
+  console.log(`  Player:  ${transcodeAvailable() ? 'ffmpeg ready — AAC audio + track switching' : 'original streams only (ffmpeg not installed)'}`)
+  console.log(`  Index:   ${indexStats().titles} titles already learned`)
   console.log('  ─────────────────────────────────────────────')
   console.log('')
 
@@ -42,4 +45,12 @@ app.listen(PORT, '0.0.0.0', () => {
   startWarmup()
     .then((n) => n && console.log(`[warmup] scanning details for ${n} catalog titles in background…`))
     .catch((err) => console.warn('[warmup] skipped:', err.message))
+
+  // Long, gentle crawl that teaches the app real IMDb ratings across the
+  // catalog. Results persist to data/catalog-index.json between restarts.
+  setTimeout(() => {
+    startCrawl()
+      .then((n) => n && console.log(`[index] learned ratings for ${n} more titles`))
+      .catch((err) => console.warn('[index] crawl skipped:', err.message))
+  }, 3000)
 })

@@ -13,10 +13,13 @@ import {
   getHindiSections,
   getHome,
   getListing,
+  indexStats,
   searchCatalog,
+  startCrawl,
   startWarmup,
 } from './catalog.js'
 import { aiMeta, aiConfigured, recommend, similarTo } from './ai.js'
+import { probeStream, startStream, transcodeAvailable } from './player.js'
 import { enrich, tmdbConfigured } from './tmdb.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -59,6 +62,8 @@ app.get('/api/health', (req, res) => {
     catalog: catalogMeta,
     ai: aiMeta(),
     tmdb: { configured: tmdbConfigured() },
+    index: indexStats(),
+    player: { transcode: transcodeAvailable() },
     mode: process.env.VERCEL ? 'vercel' : 'local',
   })
 })
@@ -150,12 +155,86 @@ app.get(
   }),
 )
 
+app.get(
+  '/api/stream-info',
+  wrap(async (req, res) => {
+    const slug = String(req.query.slug || '')
+    if (!slug) return res.status(400).json({ error: 'slug is required' })
+    const detail = await getDetail(slug)
+    const source = detail.sources?.[0]?.url || ''
+    const info = source ? await probeStream(source) : null
+    res.set('Cache-Control', 'public, max-age=1800')
+    res.json({
+      slug,
+      source,
+      transcode: transcodeAvailable(),
+      info,
+      filenameAudio: detail.audio || null,
+      downloadUrl: detail.downloadUrl || '',
+      watchUrl: detail.watchUrl,
+    })
+  }),
+)
+
+/**
+ * Browser-friendly playback: video is copied, the chosen audio track is
+ * converted to AAC. `a` = audio track ordinal, `t` = start position in seconds
+ * (the player restarts the stream when the viewer seeks).
+ */
+app.get(
+  '/api/play',
+  wrap(async (req, res) => {
+    const slug = String(req.query.slug || '')
+    const audio = Math.max(0, Number(req.query.a || 0) || 0)
+    const start = Math.max(0, Number(req.query.t || 0) || 0)
+    if (!slug) return res.status(400).json({ error: 'slug is required' })
+    if (!transcodeAvailable()) {
+      return res.status(503).json({ error: 'Audio remuxing is not available on this server' })
+    }
+
+    const detail = await getDetail(slug)
+    const source = detail.sources?.[0]?.url
+    if (!source) return res.status(404).json({ error: 'No direct stream for this title' })
+
+    const info = await probeStream(source).catch(() => null)
+    const trackCount = info?.audio?.length || 1
+    const ordinal = Math.min(audio, trackCount - 1)
+
+    res.status(200)
+    res.setHeader('Content-Type', 'video/mp4')
+    res.setHeader('Cache-Control', 'no-store')
+    res.setHeader('Accept-Ranges', 'none')
+
+    const child = startStream({ url: source, audioOrdinal: ordinal, startSec: start })
+    let failure = ''
+    child.stderr.on('data', (chunk) => {
+      if (failure.length < 600) failure += chunk.toString()
+    })
+    child.stdout.pipe(res)
+    child.on('error', () => res.destroy())
+    child.on('close', (code) => {
+      if (code && failure) console.warn('[play] ffmpeg:', failure.trim().slice(0, 300))
+      if (!res.writableEnded) res.destroy()
+    })
+    req.on('close', () => child.kill('SIGKILL'))
+  }),
+)
+
 app.post(
   '/api/ai/recommend',
   rateLimit(30, 10 * 60 * 1000),
   wrap(async (req, res) => {
-    const { message, memory, prefs, referenceSlug, targetName, avoidSlugs } = req.body || {}
-    const result = await recommend({ message, memory, prefs, referenceSlug, targetName, avoidSlugs })
+    const { message, memory, prefs, referenceSlug, targetName, avoidSlugs, history, topic } = req.body || {}
+    const result = await recommend({
+      message,
+      memory,
+      prefs,
+      referenceSlug,
+      targetName,
+      avoidSlugs,
+      history,
+      topic,
+    })
     res.json(result)
   }),
 )

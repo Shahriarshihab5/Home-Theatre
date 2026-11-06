@@ -4,3 +4,10 @@ dist/
 *.log
 .DS_Store
 project_doc.txt
+test.mp4
+
+# Live learned index (rebuilt on the home network; the cloud uses the snapshot)
+/data/
+
+# Scratch space for the poster builder
+public/posters/_tmp/

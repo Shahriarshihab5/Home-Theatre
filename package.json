@@ -10,7 +10,9 @@
     "dev:api": "node server/index.js",
     "build": "tsc -p tsconfig.json && vite build",
     "start": "node server/index.js",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "snapshot": "node scripts/make-snapshot.mjs",
+    "posters": "node scripts/make-posters.mjs"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

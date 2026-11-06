@@ -104,13 +104,91 @@ export function useVoiceRecognition({ lang = 'en-IN', onFinal }: UseVoiceOptions
 
 /* ─────────────────────────────── speech output ───────────────────────────── */
 
-export function speak(text: string) {
+export type VoiceLang = 'en' | 'bn'
+export type VoiceGender = 'female' | 'male'
+
+const VOICE_LANG_ORDER: Record<VoiceLang, string[]> = {
+  en: ['en-in', 'en-gb', 'en-us', 'en-au', 'en'],
+  bn: ['bn-bd', 'bn-in', 'bn'],
+}
+
+const FEMALE_HINTS = /female|woman|zira|heera|neerja|samantha|karen|tessa|victoria|susan|fiona|moira|aria|jenny|emma|ava|allison|serena|swara|kalpana/i
+const MALE_HINTS = /\bmale\b|man\b|david|mark\b|ravi|rishi|daniel|alex\b|fred|george|james|ryan|guy\b|prabhat|hemant/i
+
+/** Browsers load voices asynchronously; keep a warm cache for the TV UI. */
+let cachedVoices: SpeechSynthesisVoice[] = []
+
+export function primeVoices() {
+  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return
+  const load = () => {
+    const list = window.speechSynthesis.getVoices()
+    if (list.length) cachedVoices = list
+  }
+  load()
+  window.speechSynthesis.onvoiceschanged = load
+}
+
+/** Voices available on this device, for the settings screen. */
+export function availableVoices(lang: VoiceLang) {
+  const list = cachedVoices.length ? cachedVoices : window.speechSynthesis?.getVoices?.() || []
+  return list.filter((v) => VOICE_LANG_ORDER[lang].some((tag) => v.lang?.toLowerCase().replace('_', '-').startsWith(tag)))
+}
+
+function scoreVoice(voice: SpeechSynthesisVoice, lang: VoiceLang, gender: VoiceGender) {
+  const voiceLang = (voice.lang || '').toLowerCase().replace('_', '-')
+  const rank = VOICE_LANG_ORDER[lang].findIndex((tag) => voiceLang === tag || voiceLang.startsWith(`${tag}-`))
+  if (rank < 0) return -1
+  let score = (VOICE_LANG_ORDER[lang].length - rank) * 10
+  const name = `${voice.name} ${voice.voiceURI}`
+  const female = FEMALE_HINTS.test(name)
+  const male = MALE_HINTS.test(name)
+  if (gender === 'female') {
+    if (female) score += 6
+    if (male && !female) score -= 4
+  } else {
+    if (male) score += 6
+    if (female && !male) score -= 4
+  }
+  if (voice.localService) score += 1
+  return score
+}
+
+export function pickVoice(lang: VoiceLang, gender: VoiceGender): SpeechSynthesisVoice | null {
+  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return null
+  const list = cachedVoices.length ? cachedVoices : window.speechSynthesis.getVoices()
+  if (list.length) cachedVoices = list
+  let best: SpeechSynthesisVoice | null = null
+  let bestScore = -1
+  for (const voice of list) {
+    const score = scoreVoice(voice, lang, gender)
+    if (score > bestScore) {
+      best = voice
+      bestScore = score
+    }
+  }
+  return bestScore >= 0 ? best : null
+}
+
+export interface SpeakOptions {
+  lang?: VoiceLang
+  gender?: VoiceGender
+}
+
+export function speak(text: string, { lang = 'en', gender = 'female' }: SpeakOptions = {}) {
   if (!text || typeof window === 'undefined' || !('speechSynthesis' in window)) return
   try {
+    primeVoices()
     window.speechSynthesis.cancel()
     const utterance = new SpeechSynthesisUtterance(text)
-    utterance.rate = 1
-    utterance.pitch = 1
+    const voice = pickVoice(lang, gender)
+    if (voice) {
+      utterance.voice = voice
+      utterance.lang = voice.lang
+    } else {
+      utterance.lang = lang === 'bn' ? 'bn-BD' : 'en-IN'
+    }
+    utterance.rate = lang === 'bn' ? 0.92 : 1
+    utterance.pitch = gender === 'female' ? 1.08 : 0.92
     window.speechSynthesis.speak(utterance)
   } catch {
     /* TV browsers may not expose speech output — harmless */

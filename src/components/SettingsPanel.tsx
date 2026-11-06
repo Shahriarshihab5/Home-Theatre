@@ -2,9 +2,10 @@ import { useEffect, useState } from 'react'
 import { aiProviderLabel, api, imgSrc, prettyTitle, streamMode } from '../lib/api'
 import { useMemory } from '../lib/memory'
 import { focusFirst } from '../lib/nav'
+import { availableVoices, primeVoices, speak } from '../lib/speech'
 import { getSfxEnabled, setSfxEnabled, subscribeSfx } from '../lib/sfx'
-import type { HealthInfo } from '../types'
-import { BookmarkIcon, CheckIcon, DownloadIcon, HeartIcon, ThumbDownIcon, TrashIcon, XIcon } from './icons'
+import type { HealthInfo, VoiceGender, VoiceLang } from '../types'
+import { BookmarkIcon, CheckIcon, DownloadIcon, HeartIcon, SpeakerIcon, ThumbDownIcon, TrashIcon, XIcon } from './icons'
 
 interface SettingsPanelProps {
   open: boolean
@@ -44,8 +45,16 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
   const [confirmReset, setConfirmReset] = useState(false)
   const [busy, setBusy] = useState(false)
   const [sfx, setSfx] = useState(() => getSfxEnabled())
+  const [, setVoiceTick] = useState(0)
 
   useEffect(() => subscribeSfx(setSfx), [])
+
+  useEffect(() => {
+    if (!open) return
+    primeVoices()
+    const timer = setTimeout(() => setVoiceTick((n) => n + 1), 500)
+    return () => clearTimeout(timer)
+  }, [open])
 
   useEffect(() => {
     if (!open) return
@@ -157,6 +166,81 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
               hint="Soft ticks as you move, a chime when the AI finds new picks."
             />
           </div>
+        </section>
+
+        <section className="mb-5 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+          <h3 className="mb-1 flex items-center justify-between text-sm font-bold uppercase tracking-widest text-white/40">
+            <span>Assistant voice</span>
+            <span className="text-[0.6rem] normal-case tracking-normal text-white/25">spoken only</span>
+          </h3>
+          <p className="mb-3 text-xs leading-relaxed text-white/40">
+            The AI can talk in English or Bengali. On-screen text stays English; this only changes what you hear.
+          </p>
+
+          <p className="mb-1.5 text-[0.65rem] font-bold uppercase tracking-widest text-white/30">Language</p>
+          <div className="flex flex-wrap gap-2">
+            {(
+              [
+                ['en', 'English'],
+                ['bn', 'বাংলা Bangla'],
+              ] as [VoiceLang, string][]
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                data-nav
+                onClick={() => memory.setPrefs({ voiceLang: id })}
+                className={`chip !text-sm ${memory.prefs.voiceLang === id ? '!border-gold !bg-gold/15 !text-gold' : ''}`}
+              >
+                {memory.prefs.voiceLang === id ? <CheckIcon width={14} height={14} /> : null}
+                {label}
+              </button>
+            ))}
+          </div>
+
+          <p className="mb-1.5 mt-3 text-[0.65rem] font-bold uppercase tracking-widest text-white/30">Voice</p>
+          <div className="flex flex-wrap gap-2">
+            {(
+              [
+                ['female', 'Female'],
+                ['male', 'Male'],
+              ] as [VoiceGender, string][]
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                data-nav
+                onClick={() => memory.setPrefs({ voiceGender: id })}
+                className={`chip !text-sm ${memory.prefs.voiceGender === id ? '!border-gold !bg-gold/15 !text-gold' : ''}`}
+              >
+                {memory.prefs.voiceGender === id ? <CheckIcon width={14} height={14} /> : null}
+                {label}
+              </button>
+            ))}
+            <button
+              type="button"
+              data-nav
+              onClick={() => {
+                primeVoices()
+                const bangla = memory.prefs.voiceLang === 'bn'
+                speak(
+                  bangla
+                    ? 'হ্যালো! আজ রাতে কী দেখতে চাও? আমি তোমার জন্য সেরা সিনেমা বেছে নিচ্ছি।'
+                    : 'Hi! I am your movie companion. What should we watch tonight?',
+                  { lang: memory.prefs.voiceLang, gender: memory.prefs.voiceGender },
+                )
+              }}
+              className="btn-soft !py-1.5 text-xs"
+            >
+              <SpeakerIcon width={14} height={14} /> Test voice
+            </button>
+          </div>
+
+          <p className="mt-2 text-[0.65rem] leading-relaxed text-white/30">
+            {memory.prefs.voiceLang === 'bn'
+              ? `${availableVoices('bn').length} Bengali voice${availableVoices('bn').length === 1 ? '' : 's'} found on this device. If it sounds wrong, install Bengali text-to-speech on the TV (Android TV: Settings → System → Languages → Text-to-speech).`
+              : 'For Bengali speech, the TV needs a Bengali text-to-speech voice installed (Android TV: Settings → System → Languages → Text-to-speech).'}
+          </p>
         </section>
 
         <section className="mb-5 rounded-2xl border border-white/10 bg-white/[0.03] p-4">

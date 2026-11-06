@@ -4,7 +4,8 @@
   "outputDirectory": "dist",
   "functions": {
     "api/[...path].js": {
-      "maxDuration": 60
+      "maxDuration": 60,
+      "includeFiles": "server/data/**"
     }
   }
 }

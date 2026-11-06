@@ -13,7 +13,7 @@
  *    so the app stays fully usable.
  */
 
-import { getDetail, getListing, peekDetail, searchCatalog } from './catalog.js'
+import { getDetail, getListing, indexEntry, indexedTitles, peekDetail, searchCatalog } from './catalog.js'
 
 /* ─────────────────────────── provider config ─────────────────────────── */
 
@@ -87,17 +87,71 @@ function matchSegments(message) {
   // Always add broad, high-quality rows so there are enough verified
   // candidates for a 10–15 title answer, even when the wording is vague.
   const filler = [
-    { type: 'genre', slug: 'drama' },
-    { type: 'genre', slug: 'action' },
-    { type: 'genre', slug: 'thriller' },
-    { type: 'genre', slug: 'comedy' },
-    { type: 'genre', slug: 'family' },
-    { type: 'genre', slug: 'tv-show' },
+    { type: 'genre', slug: 'drama', filler: true },
+    { type: 'genre', slug: 'action', filler: true },
+    { type: 'genre', slug: 'thriller', filler: true },
+    { type: 'genre', slug: 'comedy', filler: true },
+    { type: 'genre', slug: 'family', filler: true },
+    { type: 'genre', slug: 'tv-show', filler: true },
   ]
   for (const entry of filler) {
     if (!found.some((f) => f.type === entry.type && f.slug === entry.slug)) found.push(entry)
   }
-  return found.slice(0, 7)
+  return found.filter((entry) => !entry.filler).concat(found.filter((entry) => entry.filler)).slice(0, 7)
+}
+
+/* Normalised matching against the learned index (genres come from CircleFTP
+   detail pages, so "sci-fi" arrives as "Sci-Fi" or "Science Fiction"). */
+const GENRE_PATTERNS = {
+  action: /^action/i,
+  comedy: /^comedy/i,
+  thriller: /thriller/i,
+  horror: /^horror/i,
+  romance: /romance/i,
+  drama: /^drama/i,
+  family: /^family/i,
+  animation: /animation/i,
+  crime: /^crime/i,
+  mystery: /^mystery/i,
+  'sci-fi': /sci[- ]?fi|science fiction/i,
+  fantasy: /^fantasy/i,
+  adventure: /^adventure/i,
+  biography: /biograph/i,
+  war: /^war/i,
+  history: /history/i,
+  'tv-show': /tv|series|soap/i,
+}
+
+const COUNTRY_PATTERNS = {
+  korean: /korea/i,
+  india: /india/i,
+  tamil: /tamil/i,
+  japan: /japan/i,
+  china: /china/i,
+  thailand: /thai/i,
+  turkey: /turk/i,
+  usa: /usa|united states/i,
+  uk: /united kingdom|^uk$/i,
+  'south-korea': /korea/i,
+}
+
+function relevanceFor(entry, segments, words) {
+  let score = 0
+  for (const seg of segments) {
+    if (seg.filler) continue
+    if (seg.type === 'country') {
+      const re = COUNTRY_PATTERNS[seg.slug]
+      if (re && re.test(entry.country || '')) score += 10
+    } else {
+      const re = GENRE_PATTERNS[seg.slug]
+      if (re && (entry.genres || []).some((g) => re.test(g))) score += 7
+    }
+  }
+  if (words.length) {
+    const hay = `${entry.title} ${(entry.genres || []).join(' ')} ${entry.country || ''}`.toLowerCase()
+    score += words.filter((w) => hay.includes(w)).length * 6
+  }
+  return score
 }
 
 function dedupeCandidates(pages) {
@@ -106,22 +160,66 @@ function dedupeCandidates(pages) {
     if (!page) continue
     for (const item of page.items || []) {
       if (!map.has(item.slug)) {
-        // Warm-up usually has detail data cached; if so, give the model the
-        // verified audio label so it doesn't have to guess about Hindi.
+        // Detail data (warm-up / index) gives us the verified audio label and
+        // real IMDb rating, so the model does not have to guess.
         const cached = peekDetail(item.slug)
+        const learned = indexEntry(item.slug)
         map.set(item.slug, {
           slug: item.slug,
           title: item.title,
           via: page.label,
-          thumb: item.thumb,
-          quality: item.quality,
-          audio: cached?.audio?.label && cached.audio.verified ? cached.audio.label : '',
-          hindi: Boolean(cached?.audio?.hindi),
+          thumb: item.thumb || learned?.thumb || '',
+          quality: item.quality || learned?.quality,
+          imdb: cached?.imdbRating ?? learned?.imdb ?? null,
+          genres: cached?.genres || learned?.genres || [],
+          country: cached?.country || learned?.country || '',
+          series: Boolean(learned?.series),
+          audio: cached?.audio?.label && cached.audio.verified ? cached.audio.label : learned?.audio || '',
+          hindi: Boolean(cached?.audio?.hindi ?? learned?.hindi),
         })
       }
     }
   }
   return [...map.values()]
+}
+
+/** How many detail pages we may fetch per request to learn ratings. */
+function ratingBudget() {
+  const configured = Number(process.env.RATING_BUDGET)
+  if (Number.isFinite(configured) && configured > 0) return configured
+  return process.env.VERCEL ? 10 : 36
+}
+
+/** Fill in missing ratings for the most promising candidates. */
+async function fillRatings(candidates, budget = ratingBudget()) {
+  const unknown = candidates.filter((c) => c.imdb == null)
+  if (!unknown.length) return
+  await Promise.all(
+    unknown.slice(0, budget).map(async (c) => {
+      const detail = await getDetail(c.slug).catch(() => null)
+      if (!detail) return
+      c.imdb = detail.imdbRating ?? null
+      c.genres = c.genres?.length ? c.genres : detail.genres || []
+      c.country = c.country || detail.country || ''
+      c.thumb = c.thumb || detail.thumb || ''
+      c.quality = c.quality || detail.quality
+      c.audio = detail.audio?.verified ? detail.audio.label : c.audio
+      c.hindi = c.hindi || Boolean(detail.audio?.hindi)
+      c.series = c.series || /tv[\s-]?series|tv[\s-]?show|web[\s-]?series|soap/i.test((detail.genres || []).join(' '))
+    }),
+  )
+}
+
+/** Quality-aware ordering: relevant first, then the best-rated. */
+function rankCandidates(candidates) {
+  return candidates
+    .map((c) => {
+      const rating = typeof c.imdb === 'number' ? c.imdb : 5.9 // neutral prior
+      const total = (c.rel || 0) * 0.9 + rating * 2.4
+      return { c, total }
+    })
+    .sort((a, b) => b.total - a.total)
+    .map(({ c }) => c)
 }
 
 async function gatherCandidates(message, { referenceSlug } = {}) {
@@ -186,7 +284,54 @@ async function gatherCandidates(message, { referenceSlug } = {}) {
   )
   pages.push(...segmentPages.filter(Boolean))
 
-  return dedupeCandidates(pages).slice(0, 150)
+  const fromListings = dedupeCandidates(pages)
+  for (const candidate of fromListings) {
+    candidate.rel = relevanceFor(candidate, segments, words) + 4
+  }
+
+  // Everything the app has learned about the catalog, ranked for this request.
+  const learned = indexedTitles()
+    .map((entry) => {
+      const rel = relevanceFor(entry, segments, words)
+      return { entry, rel }
+    })
+    .filter(({ entry, rel }) => rel > 0 || (entry.imdb ?? 0) >= 7.6)
+    .sort((a, b) => b.rel * 0.9 + (b.entry.imdb ?? 5.9) * 2.4 - (a.rel * 0.9 + (a.entry.imdb ?? 5.9) * 2.4))
+    .slice(0, 160)
+    .map(({ entry, rel }) => ({
+      slug: entry.slug,
+      title: entry.title,
+      via: 'learned catalog index',
+      thumb: entry.thumb,
+      quality: entry.quality,
+      imdb: entry.imdb,
+      genres: entry.genres || [],
+      country: entry.country || '',
+      series: Boolean(entry.series),
+      audio: entry.audio || '',
+      hindi: Boolean(entry.hindi),
+      rel,
+    }))
+
+  // Merge: listings keep their "found in …" label; the index fills gaps.
+  const merged = new Map()
+  for (const candidate of fromListings) merged.set(candidate.slug, candidate)
+  for (const candidate of learned) {
+    const existing = merged.get(candidate.slug)
+    if (existing) {
+      existing.imdb = existing.imdb ?? candidate.imdb
+      existing.rel = Math.max(existing.rel, candidate.rel)
+      existing.genres = existing.genres?.length ? existing.genres : candidate.genres
+      existing.country = existing.country || candidate.country
+      existing.series = existing.series || candidate.series
+    } else {
+      merged.set(candidate.slug, candidate)
+    }
+  }
+
+  const pool = [...merged.values()]
+  await fillRatings(rankCandidates(pool))
+  return rankCandidates(pool).slice(0, 150)
 }
 
 const STOPWORDS = new Set([
@@ -202,7 +347,7 @@ const STOPWORDS = new Set([
 
 /* ───────────────────────────── provider calls ───────────────────────────── */
 
-function buildPrompt({ message, candidates, memory, prefs, targetName }) {
+function buildPrompt({ message, candidates, memory, prefs, targetName, history = [], coverage = {} }) {
   const liked = (memory?.likes || []).slice(0, 25).map((x) => x.title)
   const disliked = (memory?.dislikes || []).slice(0, 15).map((x) => x.title)
   const watched = (memory?.watched || []).slice(0, 60).map((x) => x.title)
@@ -222,14 +367,27 @@ function buildPrompt({ message, candidates, memory, prefs, targetName }) {
       messageText,
     )
   const wantsHindi = /\bhindi\b|dubbed/i.test(messageText)
+  // The viewer can ask the assistant to *speak* in Bengali while the on-screen
+  // text stays English, so the model returns a short extra summary for TTS.
+  const wantsBanglaVoice = prefs?.voiceLang === 'bn'
 
   const candidateLines = candidates
     .map(
       (c) =>
         `- ${c.slug} :: ${c.title}${c.quality ? ` [${c.quality}]` : ''}${
-          c.audio ? ` [audio: ${c.audio}]` : ''
-        } (found in ${c.via})`,
+          typeof c.imdb === 'number' ? ` [IMDb ${c.imdb.toFixed(1)}]` : ' [rating unknown]'
+        }${c.audio ? ` [audio: ${c.audio}]` : ''}${
+          c.series ? ' [web series]' : ''
+        }${c.genres?.length ? ` [${c.genres.slice(0, 3).join(', ')}]` : ''} (found in ${c.via})`,
     )
+    .join('\n')
+
+  const ratedCount = candidates.filter((c) => typeof c.imdb === 'number').length
+
+  const conversation = (Array.isArray(history) ? history : [])
+    .filter((turn) => turn && turn.text)
+    .slice(-8)
+    .map((turn) => `${turn.role === 'assistant' ? 'You' : 'Viewer'}: ${String(turn.text).slice(0, 500)}`)
     .join('\n')
 
   const system = `You are "Home Movie Theatre", a personal movie companion built into a Smart TV app.
@@ -237,16 +395,23 @@ You recommend ONLY titles from the VERIFIED CATALOG below — titles that are co
 You must never invent titles, slugs, ratings or availability.
 
 RULES
-1. Return 10 to 15 titles exclusively from the VERIFIED CATALOG — never fewer than 10. Mix movies and web series when the catalog has both. Copy their slugs exactly.
+1. Return up to 15 titles exclusively from the VERIFIED CATALOG and aim for 10–15. Copy their slugs exactly. If the request is narrow (a specific country + format + audio) and fewer than 10 titles genuinely match, return only the ones that truly match (at least 5) and say the choice is small. NEVER pad the list with titles from another country, genre, audience or format just to reach ten.
 2. Explain each pick in 1-2 short sentences ("why"), referencing genre, mood, country, IMDb rating if known, or audio info. Be concrete, not salesy.
-3. Respect preferences: Hindi audio first when the user asks for it; family-friendly tone when family mode is on. An explicit country or language in the request (e.g. "Korean", "Turkish", "Tamil") always overrides the saved Hindi preference and the taste profile. A candidate line may include "[audio: …]" — that label is read from the actual stream filename and is verified, so trust it and say Hindi is available when it is listed. If audio is not listed for a title, say it is unconfirmed rather than guessing. The same honesty applies to content suitability ("check content rating").
-4. If the user asks to avoid already-watched titles, exclude them (watched list provided).
-5. Reference the user's taste signals when useful ("because you liked …").
-6. Conversation tone: warm, concise, TV-friendly. No markdown tables.
-7. The "reply" is a short spoken-style answer (2-4 sentences) that introduces the picks.
-8. If the request does not name a language or country, do NOT default to one industry. Mix at least three different countries/audio languages. If the request asks for web series, favour episodic/series candidates and avoid filling the list with unrelated films.
-9. Output STRICT JSON only, matching:
-{"reply": string, "picks": [{"slug": string, "why": string}], "followups": [string, string, string]}
+3. QUALITY COMES FIRST. The catalog is huge, so never pad the list with weak titles:
+   - Strongly prefer titles rated 7.0 or higher.
+   - Only include a title rated below 6.0 if you have fewer than 10 candidates rated above it.
+   - Never include anything rated below 5.0 unless the viewer explicitly asked for that exact title.
+   - "[rating unknown]" means the app has not scanned that title yet — allowed, but place them after picks with good known ratings.
+4. Respect preferences: Hindi audio first when the user asks for it; family-friendly tone when family mode is on. An explicit country or language in the request (e.g. "Korean", "Turkish", "Tamil") always overrides the saved Hindi preference and the taste profile. A candidate line may include "[audio: …]" — that label is read from the actual stream filename and is verified, so trust it and say Hindi is available when it is listed. If audio is not listed for a title, say it is unconfirmed rather than guessing. The same honesty applies to content suitability ("check content rating").
+5. If the user asks to avoid already-watched titles, exclude them (watched list provided).
+6. Reference the user's taste signals when useful ("because you liked …").
+7. Conversation tone: warm, concise, TV-friendly. No markdown tables.
+8. The "reply" is a short spoken-style answer (2-4 sentences) that introduces the picks. If the catalog cannot fully satisfy the request, say so honestly in ONE short sentence, then present the closest on-topic titles — never quietly swap in an unrelated genre, audience or format.
+9. If the request does not name a language or country, do NOT default to one industry. Mix at least three different countries/audio languages. If the request asks for a web series, use only candidates marked "[web series]". If none are marked, say in one sentence that this catalog has no web series, then recommend the closest matching MOVIES from the SAME country/genre/mood. Family, kids and animation titles are only allowed when the viewer asked for family/kids/animation or family mode is on.
+10. THIS IS A CONVERSATION. When earlier turns exist, the latest message is usually feedback on your previous picks ("no brother I don't like it", "update a bit", "not this type"). Then: acknowledge it in one short sentence, change the selection meaningfully in the direction the feedback implies, and never repeat a title you already suggested. If the feedback is vague, vary the picks decisively instead of asking many questions.
+11. Output STRICT JSON only, matching:
+{"reply": string, "picks": [{"slug": string, "why": string}], "followups": [string, string, string]${wantsBanglaVoice ? ', "replyBn": string' : ''}}
+${wantsBanglaVoice ? '12. The viewer chose a Bengali speaking voice. Also write "replyBn": the same short introduction in natural Bengali (বাংলা script) for text-to-speech — 1 to 2 warm sentences, no transliteration, no English sentences, no markdown. Keep it faithful to "reply".' : ''}
 
 USER MEMORY
 ${
@@ -272,6 +437,19 @@ Hindi audio preferred: ${
         : 'no'
   }
 Family friendly only: ${prefs?.familyOnly ? 'YES' : 'no'}
+Spoken reply language: ${wantsBanglaVoice ? 'Bengali (বাংলা) — also fill "replyBn"' : 'English'}
+
+${conversation ? `CONVERSATION SO FAR\n${conversation}\n\n` : ''}REQUEST COVERAGE
+Title type requested: ${coverage.wantsSeries ? 'web series' : 'any'}
+Verified web-series candidates in this pool: ${coverage.seriesCount ?? 0}
+${
+  coverage.wantsSeries && !coverage.seriesCount
+    ? 'IMPORTANT: this catalog currently has no verified web series. Say that once, briefly, then recommend the closest matching MOVIES from the same country/genre/mood — do not substitute family, kids or animation titles unless the viewer asked for them.'
+    : ''
+}
+
+CATALOG QUALITY NOTE
+${ratedCount} of the ${candidates.length} candidates below have a verified IMDb rating.
 
 VERIFIED CATALOG (slug :: title):
 ${candidateLines}`
@@ -476,17 +654,20 @@ function localRecommend(message, candidates, memory, prefs, { aiAttempted = fals
   const scored = candidates
     .filter((c) => !(wantsNew && watchedSlugs.has(c.slug)))
     .map((c) => {
-      let score = 0
+      let score = typeof c.rel === 'number' ? c.rel : 0
       for (const [genre, weight] of likedGenres) {
-        if (c.via.toLowerCase().includes(genre.toLowerCase())) score += weight
+        if ((c.genres || []).some((g) => g.toLowerCase() === genre.toLowerCase())) score += weight
+        else if (c.via.toLowerCase().includes(genre.toLowerCase())) score += weight * 0.5
       }
       if (familyWords && /family|animation/i.test(c.via)) score += 8
       if (prefs?.familyOnly && /family|animation/i.test(c.via)) score += 5
       if (wantsKorean && /korean/i.test(c.via)) score += 14
       if (wantsThriller && /thriller|crime|mystery/i.test(c.via)) score += 8
       if (wantsSeries && /tv-show|tv-series|series/i.test(c.via)) score += 10
-      if (wantsHindi && /hindi/i.test(c.title)) score += 2
-      if (/search:/i.test(c.via)) score += 12
+      if (wantsHindi && (c.hindi || /hindi/i.test(c.title))) score += 2
+      if (/search:/i.test(c.via)) score += 6
+      // Real quality dominates: a 7.8 title beats a 4.9 one by a wide margin.
+      score += (typeof c.imdb === 'number' ? c.imdb : 6) * 4
       return { ...c, score }
     })
     .sort((a, b) => b.score - a.score)
@@ -494,9 +675,11 @@ function localRecommend(message, candidates, memory, prefs, { aiAttempted = fals
   const picks = scored.slice(0, 12).map((c) => ({
     slug: c.slug,
     why:
-      c.score > 0
-        ? `Matches your request via ${c.via.replace(/^.*?: /, '')}. Open it to confirm audio and details.`
-        : `A verified CircleFTP pick from ${c.via.replace(/^.*?: /, '')}.`,
+      typeof c.imdb === 'number'
+        ? `IMDb ${c.imdb.toFixed(1)} and verified in the catalog${
+            c.audio ? ` · ${c.audio}` : ''
+          }.`
+        : `Verified in the CircleFTP catalog${c.audio ? ` · ${c.audio}` : ''}.`,
   }))
 
   const wanted = [wantsKorean ? 'Korean titles' : null, wantsThriller ? 'thriller' : null, wantsHindi ? 'Hindi audio' : null]
@@ -595,12 +778,17 @@ export async function recommend({
   referenceSlug,
   targetName = null,
   avoidSlugs = [],
+  history = [],
+  topic = '',
 } = {}) {
   const text = String(message || '').trim()
   if (!text) throw Object.assign(new Error('Message is required'), { status: 400 })
 
   const avoid = new Set((Array.isArray(avoidSlugs) ? avoidSlugs : []).map((s) => String(s)))
-  const gathered = await gatherCandidates(text, { referenceSlug })
+  // When the viewer is reacting to previous picks ("no brother, not these"),
+  // gather candidates for the original topic, not for the complaint itself.
+  const gatheringText = topic ? `${topic} ${text}` : text
+  const gathered = await gatherCandidates(gatheringText, { referenceSlug })
   const candidates = avoid.size ? gathered.filter((c) => !avoid.has(c.slug)) : gathered
   if (!candidates.length) {
     return {
@@ -615,6 +803,18 @@ export async function recommend({
 
   const candidateMap = new Map(candidates.map((c) => [c.slug, c]))
 
+  // ── request coverage ─────────────────────────────────────────────────────
+  // The catalog is movie-heavy and has no real TV-series section, so the model
+  // must know that up front instead of pretending or swapping in random titles.
+  const wantsSeries = /\b(web[\s-]?series|tv[\s-]?series|tv[\s-]?show|series|seasons?|episodes?)\b/i.test(
+    text,
+  )
+  const seriesCount = candidates.filter((c) => c.series).length
+  const coverage = { wantsSeries, seriesCount }
+  const focusCountries = matchSegments(gatheringText).filter(
+    (segment) => !segment.filler && segment.type === 'country',
+  )
+
   if (!aiConfigured()) {
     const local = localRecommend(text, candidates, memory, prefs, { targetName })
     const picks = await hydratePicks(local.picks, candidateMap)
@@ -623,7 +823,9 @@ export async function recommend({
 
   let parsed
   try {
-    const content = await callModel(buildPrompt({ message: text, candidates, memory, prefs, targetName }))
+    const content = await callModel(
+      buildPrompt({ message: text, candidates, memory, prefs, targetName, history, coverage }),
+    )
     parsed = parseJsonLoose(content)
   } catch (err) {
     // Fall back gracefully rather than breaking the TV experience.
@@ -645,19 +847,61 @@ export async function recommend({
     { referenceSlug },
   )
 
+  // ── country guard ────────────────────────────────────────────────────────
+  // An explicit country request must never come back with other countries.
+  // Only enforce it when enough matching picks exist to stay useful.
+  const inRequestedCountry = (pick) => {
+    if (!focusCountries.length) return true
+    return focusCountries.some((segment) => {
+      const re = COUNTRY_PATTERNS[segment.slug]
+      if (!re) return true
+      return re.test(pick.country || '') || (pick.genres || []).some((genre) => re.test(genre))
+    })
+  }
+  if (focusCountries.length) {
+    const matching = hydrated.filter(inRequestedCountry)
+    if (matching.length >= 5) hydrated = matching
+  }
+
+  // ── quality guard ────────────────────────────────────────────────────────
+  // The catalog has thousands of titles, so a weak pick is a wasted slot.
+  // Drop poorly-rated picks only when enough good ones remain.
+  const strongEnough = hydrated.filter((p) => (p.imdbRating ?? 10) >= 5.5)
+  const weakDropped = strongEnough.length >= 10
+  if (weakDropped) hydrated = strongEnough
+
   // Models sometimes ignore the count. Top up from the same verified candidate
-  // set so the viewer always gets a useful 10–15 title spread.
+  // set — best-rated first — so the viewer always gets a useful 10–15 spread.
   const MIN_PICKS = 10
   const MAX_PICKS = 15
   let toppedUp = false
   if (hydrated.length < MIN_PICKS) {
     const have = new Set(hydrated.map((p) => p.slug))
-    const extras = candidates
+    // Prefer extras that satisfy the same country, so topping up cannot drag
+    // the answer off-topic.
+    const countryPool = focusCountries.length
+      ? candidates.filter((c) =>
+          focusCountries.some((segment) => {
+            const re = COUNTRY_PATTERNS[segment.slug]
+            return re ? re.test(c.country || '') || c.via.includes(segment.slug) : false
+          }),
+        )
+      : []
+    const topUpPool =
+      countryPool.length >= Math.min(MIN_PICKS, hydrated.length + countryPool.length)
+        ? countryPool
+        : candidates
+    const extras = topUpPool
       .filter((c) => !have.has(c.slug) && c.slug !== referenceSlug)
+      .filter((c) => (c.imdb ?? 10) >= 5.5)
+      .sort((a, b) => (b.imdb ?? 0) - (a.imdb ?? 0))
       .slice(0, MIN_PICKS - hydrated.length)
       .map((c) => ({
         slug: c.slug,
-        why: 'Verified in your CircleFTP catalog and a good fit for this request.',
+        why:
+          typeof c.imdb === 'number'
+            ? `IMDb ${c.imdb.toFixed(1)} — one of the best-rated matches in your catalog.`
+            : 'Verified in your CircleFTP catalog and a good fit for this request.',
       }))
     if (extras.length) {
       const extraHydrated = await hydratePicks(extras, candidateMap, { referenceSlug })
@@ -666,12 +910,16 @@ export async function recommend({
     }
   }
 
+  const rated = hydrated.filter((p) => typeof p.imdbRating === 'number')
+  const avgRating = rated.length
+    ? Math.round((rated.reduce((sum, p) => sum + p.imdbRating, 0) / rated.length) * 10) / 10
+    : null
+
   const baseReply = String(parsed.reply || 'Here are some verified picks from your catalog.').trim()
 
   return {
-    reply: toppedUp
-      ? `${baseReply} I also added a few more verified catalog options.`
-      : baseReply,
+    reply: toppedUp ? `${baseReply} I also added a few more verified catalog options.` : baseReply,
+    replyBn: String(parsed.replyBn || '').trim() || undefined,
     picks: hydrated,
     followups: Array.isArray(parsed.followups) ? parsed.followups.slice(0, 4).map(String) : [],
     source: 'ai',
@@ -679,6 +927,9 @@ export async function recommend({
     provider: activeProvider(),
     targetName: targetName || undefined,
     candidates: candidates.length,
+    avgRating,
+    ratedCount: rated.length,
+    qualityFiltered: weakDropped,
   }
 }
 

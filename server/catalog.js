@@ -22,6 +22,23 @@ const BASE = (process.env.CATALOG_BASE || 'http://hd.circleftp.net').replace(/\/
 const UA =
   'Mozilla/5.0 (Linux; Android 11; SmartTV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36 HomeMovieTheatre/1.0'
 
+const IS_SERVERLESS = Boolean(process.env.VERCEL)
+
+/**
+ * CircleFTP only answers from its own network, so a cloud host cannot browse it
+ * live. In that case we serve a snapshot of the catalog that ships with the
+ * repo (server/data/catalog-snapshot.json): browsing, search and AI picks keep
+ * working anywhere; playback still needs the home network.
+ *
+ * Set CATALOG_MODE=live to force live crawling (e.g. behind a tunnel), or
+ * CATALOG_MODE=snapshot to force the snapshot locally.
+ */
+const OFFLINE_MODE =
+  process.env.CATALOG_MODE === 'snapshot' ||
+  (IS_SERVERLESS && process.env.CATALOG_MODE !== 'live')
+
+export const offlineMode = () => OFFLINE_MODE
+
 const LIST_TTL = 30 * 60 * 1000 // 30 min
 const DETAIL_TTL = (Number(process.env.DETAIL_TTL_MINUTES) || 720) * 60 * 1000
 const SEARCH_TTL = 15 * 60 * 1000
@@ -359,21 +376,30 @@ export async function getListing(type, slug, offset = 0) {
   const off = Math.max(0, Math.floor(Number(offset) / 24) * 24)
   const path = off > 0 ? `/${type}/${slug}/${off}.html` : `/${type}/${slug}.html`
 
+  if (OFFLINE_MODE) return snapshotListing(type, slug, off)
+
   return cached(`list:${type}:${slug}:${off}`, LIST_TTL, async () => {
-    const html = await fetchPage(path)
-    const items = parseList(html)
-    const pagination = parsePagination(html, type, slug)
-    return {
-      type,
-      slug,
-      offset: off,
-      items,
-      hasMore: pagination.offsets.some((o) => o > off) || (pagination.offsets.length === 0 && items.length >= 24),
-      nextOffset: pagination.offsets.find((o) => o > off) || (items.length >= 24 ? off + 24 : null),
-      advisory:
-        type === 'country' && slug === 'korean'
-          ? 'Korean titles are listed here, but audio language is only confirmed on each title page.'
-          : undefined,
+    try {
+      const html = await fetchPage(path)
+      const items = parseList(html)
+      const pagination = parsePagination(html, type, slug)
+      return {
+        type,
+        slug,
+        offset: off,
+        items,
+        hasMore: pagination.offsets.some((o) => o > off) || (pagination.offsets.length === 0 && items.length >= 24),
+        nextOffset: pagination.offsets.find((o) => o > off) || (items.length >= 24 ? off + 24 : null),
+        advisory:
+          type === 'country' && slug === 'korean'
+            ? 'Korean titles are listed here, but audio language is only confirmed on each title page.'
+            : undefined,
+      }
+    } catch (err) {
+      // Home network hiccup: a saved listing is better than an empty screen.
+      const saved = snapshotListing(type, slug, off)
+      if (saved.items.length) return { ...saved, fallback: true }
+      throw err
     }
   })
 }
@@ -381,19 +407,40 @@ export async function getListing(type, slug, offset = 0) {
 export async function searchCatalog(query) {
   const q = String(query || '').trim()
   if (!q) return { query: '', items: [] }
+  if (OFFLINE_MODE) return snapshotSearch(q)
+
   return cached(`search:${q.toLowerCase()}`, SEARCH_TTL, async () => {
-    const html = await fetchPage(`/search.html?q=${encodeURIComponent(q)}`)
-    return { query: q, items: parseList(html) }
+    try {
+      const html = await fetchPage(`/search.html?q=${encodeURIComponent(q)}`)
+      return { query: q, items: parseList(html) }
+    } catch (err) {
+      const saved = snapshotSearch(q)
+      if (saved.items.length) return { ...saved, fallback: true }
+      throw err
+    }
   })
 }
 
 export async function getDetail(slug) {
   if (!/^[a-z0-9-]+$/.test(slug || '')) throw new Error('Invalid title slug')
   return cached(`detail:${slug}`, DETAIL_TTL, async () => {
-    const html = await fetchPage(`/watch/${slug}.html`)
-    const detail = parseDetail(html, slug)
-    if (!detail) throw new Error('Could not parse title page')
-    return detail
+    if (OFFLINE_MODE) {
+      const entry = qualityIndex.get(slug)
+      if (!entry) throw new Error('This title is not in the saved catalog snapshot.')
+      return detailFromIndex(entry)
+    }
+    try {
+      const html = await fetchPage(`/watch/${slug}.html`)
+      const detail = parseDetail(html, slug)
+      if (!detail) throw new Error('Could not parse title page')
+      rememberDetail(detail)
+      return detail
+    } catch (err) {
+      // Still show what we already know about the title (rating, genres, poster).
+      const entry = qualityIndex.get(slug)
+      if (entry) return detailFromIndex(entry)
+      throw err
+    }
   })
 }
 
@@ -414,7 +461,7 @@ export function cachedDetails() {
 
 /* ───────────────────── enrichment & taste rows ───────────────────── */
 
-const SERIES_RE = /tv[\s-]?series|tv[\s-]?show|web[\s-]?series|season\s*\d|episode\s*\d/i
+const SERIES_RE = /tv[\s-]?series|tv[\s-]?show|web[\s-]?series/i
 
 /** A title is treated as a web series when its genres or name say so. */
 export function isSeriesDetail(detail) {
@@ -471,15 +518,42 @@ function dedupeCards(items) {
 
 /** Hindi movies + web series, confirmed from the stream's own audio label. */
 export async function getHindiSections() {
+  if (OFFLINE_MODE) {
+    return cached('hindi:snapshot', HOME_TTL, async () => {
+      const all = snapshotEntries()
+      const hindi = all.filter((e) => e.hindi).sort(byRating)
+      return {
+        movies: hindi.filter((e) => !e.series).slice(0, 60).map(snapshotCard),
+        series: hindi.filter((e) => e.series).slice(0, 60).map(snapshotCard),
+        scanned: all.length,
+        updatedAt: Date.now(),
+        snapshot: true,
+      }
+    })
+  }
+
   // First visit on a cold server: make sure a scan is running.
   if (cachedDetails().length === 0) startWarmup().catch(() => {})
   warmHindi().catch(() => {})
 
   return cached('hindi', HINDI_TTL, async () => {
     const all = cachedDetails()
-    const details = all.filter((d) => d.audio?.hindi && d.sources?.length)
-    const movies = dedupeCards(details.filter((d) => !isSeriesDetail(d)).map(toCard)).slice(0, 60)
-    const series = dedupeCards(details.filter(isSeriesDetail).map(toCard)).slice(0, 60)
+    const live = all.filter((d) => d.audio?.hindi && d.sources?.length)
+    // Cold start: show the saved snapshot immediately instead of an empty row.
+    if (!live.length) {
+      const hindi = snapshotEntries().filter((e) => e.hindi).sort(byRating)
+      if (hindi.length) {
+        return {
+          movies: hindi.filter((e) => !e.series).slice(0, 60).map(snapshotCard),
+          series: hindi.filter((e) => e.series).slice(0, 60).map(snapshotCard),
+          scanned: all.length,
+          updatedAt: Date.now(),
+          snapshot: true,
+        }
+      }
+    }
+    const movies = dedupeCards(live.filter((d) => !isSeriesDetail(d)).map(toCard)).slice(0, 60)
+    const series = dedupeCards(live.filter(isSeriesDetail).map(toCard)).slice(0, 60)
     return {
       movies,
       series,
@@ -576,21 +650,35 @@ async function mapConcurrent(list, limit, fn) {
  * warm in the background and appear as soon as data is ready.
  */
 export async function getHome() {
+  if (OFFLINE_MODE) return cached('home:snapshot', HOME_TTL, async () => snapshotHome())
+
   return cached('home', HOME_TTL, async () => {
+    const ignore = { items: [], __failed: true }
     const jobs = {
-      tvSeries: getListing('genre', 'tv-series', 0).catch(() => ({ items: [] })),
-      tvShows: getListing('genre', 'tv-show', 0).catch(() => ({ items: [] })),
-      popular: getListing('genre', 'action', 0).catch(() => ({ items: [] })),
-      korean: getListing('country', 'korean', 0).catch(() => ({ items: [] })),
-      family: getListing('genre', 'family', 0).catch(() => ({ items: [] })),
-      animation: getListing('genre', 'animation', 0).catch(() => ({ items: [] })),
-      drama: getListing('genre', 'drama', 0).catch(() => ({ items: [] })),
-      thriller: getListing('genre', 'thriller', 0).catch(() => ({ items: [] })),
-      indian: getListing('country', 'india', 0).catch(() => ({ items: [] })),
+      tvSeries: getListing('genre', 'tv-series', 0).catch(() => ignore),
+      tvShows: getListing('genre', 'tv-show', 0).catch(() => ignore),
+      popular: getListing('genre', 'action', 0).catch(() => ignore),
+      korean: getListing('country', 'korean', 0).catch(() => ignore),
+      family: getListing('genre', 'family', 0).catch(() => ignore),
+      animation: getListing('genre', 'animation', 0).catch(() => ignore),
+      drama: getListing('genre', 'drama', 0).catch(() => ignore),
+      thriller: getListing('genre', 'thriller', 0).catch(() => ignore),
+      indian: getListing('country', 'india', 0).catch(() => ignore),
     }
 
     const [tvSeries, tvShows, popular, korean, family, animation, drama, thriller, indian] =
       await Promise.all(Object.values(jobs))
+
+    const outcomes = [tvSeries, tvShows, popular, korean, family, animation, drama, thriller, indian]
+    if (outcomes.every((page) => page.__failed)) {
+      // Live site unreachable (home network down). The saved catalog still
+      // gives a useful home screen instead of a blank error page.
+      const saved = snapshotHome()
+      if (saved.topRated.length || saved.latest.length) return { ...saved, fallback: true }
+      throw new Error(
+        'This server cannot reach hd.circleftp.net. CircleFTP only answers requests from its own network, so cloud hosts (Vercel) cannot load the catalog — run the app on a device on your home Wi-Fi.',
+      )
+    }
 
     const dedupe = (rows, limit) => {
       const seen = new Set()
@@ -607,11 +695,7 @@ export async function getHome() {
     }
 
     const details = cachedDetails()
-    const topRated = details
-      .filter((d) => d.imdbRating && d.sources?.length)
-      .sort((a, b) => (b.imdbRating || 0) - (a.imdbRating || 0))
-      .slice(0, 18)
-      .map(toCard)
+    const topRated = topRatedIndex({ limit: 18, min: 7.0 })
 
     const hindiDetails = details.filter((d) => d.audio?.hindi && d.sources?.length)
     const hindiMovies = dedupeCards(hindiDetails.filter((d) => !isSeriesDetail(d)).map(toCard)).slice(0, 24)
@@ -651,6 +735,7 @@ export async function warmDetails(slugs, limit = 4) {
 /** Start background warming so Top Rated / Hindi rows populate. Guarded to run once per process. */
 let warmupPromise = null
 export function startWarmup() {
+  if (OFFLINE_MODE) return Promise.resolve(0)
   if (warmupPromise) return warmupPromise
   warmupPromise = (async () => {
   const seeds = []
@@ -682,6 +767,489 @@ export function startWarmup() {
   return unique.length
   })()
   return warmupPromise
+}
+
+/* ═══════════════════════ persistent quality index ═══════════════════════ */
+/**
+ * Every detail page we ever fetch teaches us the real IMDb rating, genres,
+ * country and audio label for that title. We keep those in a JSON file so the
+ * knowledge survives restarts and keeps growing instead of being thrown away.
+ *
+ * This is what lets the AI rank by quality ("prefer 7+") instead of guessing
+ * from titles alone.
+ */
+
+const DATA_DIR = path.join(__dirname, '..', 'data')
+const INDEX_FILE = path.join(DATA_DIR, 'catalog-index.json')
+const SNAPSHOT_FILE = path.join(__dirname, 'data', 'catalog-snapshot.json')
+const INDEX_TTL = 30 * 24 * 60 * 60 * 1000
+
+const qualityIndex = new Map() // slug -> entry
+
+function toIndexEntry(detail) {
+  return {
+    slug: detail.slug,
+    title: detail.title,
+    year: detail.year ?? null,
+    imdb: detail.imdbRating ?? null,
+    genres: detail.genres || [],
+    country: detail.country || '',
+    audio: detail.audio?.label || '',
+    hindi: Boolean(detail.audio?.hindi),
+    thumb: detail.thumb || '',
+    quality: detail.quality || '',
+    series: isSeriesDetail(detail),
+    at: Date.now(),
+  }
+}
+
+/** Record a freshly parsed detail page in the quality index. */
+export function rememberDetail(detail) {
+  if (!detail?.slug) return
+  const previous = qualityIndex.get(detail.slug)
+  const entry = toIndexEntry(detail)
+  // Keep a previously known rating if this page somehow lacks one.
+  if (entry.imdb == null && previous?.imdb != null) entry.imdb = previous.imdb
+  qualityIndex.set(detail.slug, entry)
+  scheduleIndexSave()
+}
+
+export function indexedTitles() {
+  return [...qualityIndex.values()]
+}
+
+/** One learned entry (no network). */
+export function indexEntry(slug) {
+  return qualityIndex.get(String(slug || '')) || null
+}
+
+export function indexStats() {
+  const all = [...qualityIndex.values()]
+  const rated = all.filter((e) => typeof e.imdb === 'number' && e.imdb > 0)
+  return {
+    titles: all.length,
+    rated: rated.length,
+    avgRating: rated.length
+      ? Math.round((rated.reduce((s, e) => s + e.imdb, 0) / rated.length) * 10) / 10
+      : null,
+    series: all.filter((e) => e.series).length,
+    mode: OFFLINE_MODE ? 'snapshot' : 'live',
+    crawl: { ...crawlState },
+  }
+}
+
+/** Highest-rated titles we know about, optionally filtered. */
+export function topRatedIndex({ limit = 60, min = 7.2, series = null } = {}) {
+  return [...qualityIndex.values()]
+    .filter((e) => typeof e.imdb === 'number' && e.imdb >= min)
+    .filter((e) => (series === null ? true : e.series === series))
+    .sort((a, b) => b.imdb - a.imdb)
+    .slice(0, limit)
+    .map((e) => ({
+      slug: e.slug,
+      title: e.title,
+      thumb: e.thumb,
+      quality: e.quality || undefined,
+      imdbRating: e.imdb,
+      audioLabel: e.audio || undefined,
+      genres: e.genres,
+      country: e.country,
+    }))
+}
+
+/** Load the snapshot that ships with the repo (used by cloud hosts). */
+function loadSnapshot() {
+  let data = null
+  try {
+    data = JSON.parse(fs.readFileSync(SNAPSHOT_FILE, 'utf8'))
+  } catch {
+    try {
+      data = JSON.parse(fs.readFileSync(path.resolve(__dirname, 'data', 'catalog-snapshot.json'), 'utf8'))
+    } catch {
+      return
+    }
+  }
+  const entries = Array.isArray(data?.entries) ? data.entries : []
+  for (const entry of entries) {
+    if (!entry?.slug) continue
+    // Older summary data only; never overwrite tonight's live crawl.
+    qualityIndex.set(String(entry.slug), { ...entry, at: data.generatedAt || 0, snapshot: true })
+  }
+  if (entries.length) console.log(`[index] snapshot: ${entries.length} titles available offline`)
+}
+
+function loadIndex() {
+  loadSnapshot()
+  try {
+    const raw = fs.readFileSync(INDEX_FILE, 'utf8')
+    const data = JSON.parse(raw)
+    for (const entry of data?.entries || []) {
+      if (entry?.slug) qualityIndex.set(String(entry.slug), entry)
+    }
+    if (qualityIndex.size) {
+      console.log(`[index] loaded ${qualityIndex.size} known titles from disk`)
+    }
+  } catch {
+    /* first run — no live index yet */
+  }
+}
+
+let indexSaveTimer = null
+let indexDirty = false
+
+function scheduleIndexSave() {
+  if (IS_SERVERLESS) return
+  indexDirty = true
+  if (indexSaveTimer) return
+  indexSaveTimer = setTimeout(() => {
+    indexSaveTimer = null
+    if (indexDirty) saveIndexNow()
+  }, 5000)
+  indexSaveTimer.unref?.()
+}
+
+export function saveIndexNow() {
+  if (IS_SERVERLESS) return false
+  indexDirty = false
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true })
+    const payload = JSON.stringify({ v: 1, at: Date.now(), entries: [...qualityIndex.values()] })
+    const tmp = `${INDEX_FILE}.tmp`
+    fs.writeFileSync(tmp, payload)
+    fs.renameSync(tmp, INDEX_FILE)
+    return true
+  } catch (err) {
+    console.warn('[index] could not save:', err.message)
+    return false
+  }
+}
+
+loadIndex()
+
+/* ───────────────────── snapshot helpers (cloud / offline) ─────────────── */
+
+function snapshotEntries() {
+  return [...qualityIndex.values()]
+}
+
+const byRating = (a, b) => (b.imdb ?? -1) - (a.imdb ?? -1)
+
+function snapshotCard(entry) {
+  return {
+    slug: entry.slug,
+    title: entry.title,
+    thumb: entry.thumb || '',
+    quality: entry.quality || undefined,
+    imdbRating: entry.imdb ?? null,
+    audioLabel: entry.audio || undefined,
+    genres: entry.genres || [],
+    country: entry.country || '',
+  }
+}
+
+const LISTING_COUNTRY = {
+  india: /india/i,
+  usa: /usa|united states/i,
+  korean: /korea/i,
+  'south-korea': /korea/i,
+  tamil: /tamil/i,
+  japan: /japan/i,
+  china: /china/i,
+  thailand: /thai/i,
+  turkey: /turk/i,
+  uk: /united kingdom|^uk$/i,
+  france: /france/i,
+  spain: /spain/i,
+  germany: /german/i,
+  russia: /russia/i,
+  indonesia: /indonesia/i,
+}
+
+function genreMatches(entry, slug) {
+  const genres = entry.genres || []
+  if (slug === 'tv-series' || slug === 'tv-show' || /^tv[- ]?(series|show|soap)$/i.test(slug)) {
+    return Boolean(entry.series) || genres.some((genre) => /tv|series|soap/i.test(genre))
+  }
+  if (/sci[- ]?fi/i.test(slug)) {
+    return genres.some((genre) => /sci[- ]?fi|si[- ]?fi|science fiction/i.test(genre))
+  }
+  if (slug === 'family') return genres.some((genre) => /family|kids|animation/i.test(genre))
+  if (slug === 'animation') return genres.some((genre) => /animation|anime/i.test(genre))
+  const words = slug.split('-').filter(Boolean)
+  return genres.some((genre) => {
+    const lower = genre.toLowerCase()
+    return words.every((word) => lower.includes(word))
+  })
+}
+
+function matchesListing(entry, type, slug) {
+  if (type === 'country') {
+    const re = LISTING_COUNTRY[slug]
+    if (re) return re.test(entry.country || '')
+    return String(entry.country || '').toLowerCase().includes(slug.replace(/-/g, ' '))
+  }
+  return genreMatches(entry, slug)
+}
+
+function snapshotListing(type, slug, offset = 0) {
+  const matches = snapshotEntries().filter((entry) => matchesListing(entry, type, slug)).sort(byRating)
+  const next = offset + 24 < matches.length ? offset + 24 : null
+  return {
+    type,
+    slug,
+    offset,
+    items: matches.slice(offset, offset + 24).map(snapshotCard),
+    hasMore: next !== null,
+    nextOffset: next,
+    snapshot: true,
+    advisory:
+      type === 'country' && slug === 'korean'
+        ? 'Korean titles from the saved catalog. Audio language is confirmed on each title page.'
+        : undefined,
+  }
+}
+
+function snapshotSearch(query) {
+  const needle = String(query || '').toLowerCase().trim()
+  if (!needle) return { query: '', items: [], snapshot: true }
+  const words = needle.split(/\s+/).filter(Boolean)
+  const scored = []
+  for (const entry of snapshotEntries()) {
+    const title = String(entry.title || '').toLowerCase()
+    const meta = `${(entry.genres || []).join(' ')} ${entry.country || ''}`.toLowerCase()
+    let score = 0
+    if (title === needle) score = 120
+    else if (title.startsWith(needle)) score = 90
+    else if (title.includes(needle)) score = 70
+    else if (words.length > 1 && words.every((word) => title.includes(word))) score = 50
+    else if (meta.includes(needle)) score = 25
+    if (!score) continue
+    scored.push({ entry, score })
+  }
+  scored.sort((a, b) => b.score - a.score || byRating(a.entry, b.entry))
+  return {
+    query,
+    items: scored.slice(0, 60).map(({ entry }) => snapshotCard(entry)),
+    snapshot: true,
+    total: scored.length,
+  }
+}
+
+/** A detail page reconstructed from the saved index (no stream source). */
+function detailFromIndex(entry) {
+  const related = snapshotEntries()
+    .filter(
+      (other) =>
+        other.slug !== entry.slug &&
+        (entry.genres || []).some((genre) => (other.genres || []).includes(genre)),
+    )
+    .sort(byRating)
+    .slice(0, 12)
+    .map(snapshotCard)
+
+  return {
+    slug: entry.slug,
+    title: entry.title,
+    thumb: entry.thumb || '',
+    description: '',
+    genres: entry.genres || [],
+    country: entry.country || '',
+    releaseDate: entry.year ? `${entry.year}-01-01` : '',
+    year: entry.year ?? null,
+    duration: '',
+    quality: entry.quality || '',
+    imdbRating: entry.imdb ?? null,
+    sources: [],
+    altServers: [],
+    downloadUrl: '',
+    watchUrl: `${BASE}/watch/${entry.slug}.html`,
+    audio: {
+      languages: [],
+      dual: /dual|multi/i.test(entry.audio || ''),
+      hindi: Boolean(entry.hindi),
+      label: entry.audio || 'Audio tracks not listed',
+      verified: false,
+    },
+    related,
+    itemId: '',
+    fetchedAt: Date.now(),
+    snapshot: true,
+  }
+}
+
+/** Home rows built from the saved catalog — instant, works on any host. */
+function snapshotHome() {
+  const all = snapshotEntries()
+  const rated = all.filter((entry) => typeof entry.imdb === 'number' && entry.imdb > 0).sort(byRating)
+  const hindi = all.filter((entry) => entry.hindi).sort(byRating)
+  const latest = [...all]
+    .sort((a, b) => (b.year ?? 0) - (a.year ?? 0) || (b.imdb ?? -1) - (a.imdb ?? -1))
+    .slice(0, 24)
+    .map(snapshotCard)
+  const korean = all
+    .filter((entry) => /korea/i.test(entry.country || ''))
+    .sort(byRating)
+    .slice(0, 24)
+    .map(snapshotCard)
+  const family = all
+    .filter((entry) => (entry.genres || []).some((genre) => /family|animation|kids/i.test(genre)))
+    .sort(byRating)
+    .slice(0, 24)
+    .map(snapshotCard)
+  const hindiMovies = hindi.filter((entry) => !entry.series).slice(0, 24).map(snapshotCard)
+  const hindiSeries = hindi.filter((entry) => entry.series).slice(0, 24).map(snapshotCard)
+
+  return {
+    generatedAt: Date.now(),
+    latest,
+    korean,
+    koreanNote: 'Korean titles from the saved catalog. Audio language is confirmed on each title page.',
+    family,
+    topRated: topRatedIndex({ limit: 18, min: 7.0 }),
+    topRatedNote: `Saved catalog snapshot: ${rated.length} of ${all.length} titles have real IMDb ratings${
+      rated.length ? `, average ${(rated.reduce((sum, entry) => sum + entry.imdb, 0) / rated.length).toFixed(1)}` : ''
+    }.`,
+    hindiMovies,
+    hindiSeries,
+    hindiConfirmed: [...hindiMovies, ...hindiSeries].slice(0, 18),
+    hindiNote: 'Titles whose stream filename explicitly lists Hindi audio.',
+    snapshot: true,
+    sections: {
+      latest: 'Recently Added',
+      popular: 'Popular in Action',
+      korean: 'Korean Titles',
+      family: 'Family Night',
+      drama: 'Drama',
+      indian: 'Indian Cinema',
+    },
+  }
+}
+
+/* ───────────────────────── background quality crawl ───────────────────── */
+
+const CRAWL_GENRES = [
+  'action', 'drama', 'thriller', 'comedy', 'romance', 'family', 'horror',
+  'crime', 'mystery', 'sci-fi', 'animation', 'adventure', 'tv-series', 'fantasy',
+]
+const CRAWL_COUNTRIES = ['india', 'usa', 'korean', 'tamil', 'japan', 'china', 'thailand', 'turkey', 'uk']
+
+const crawlState = {
+  running: false,
+  fetched: 0,
+  pages: 0,
+  startedAt: 0,
+  finishedAt: 0,
+  target: 0,
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+function buildCrawlTasks() {
+  const tasks = []
+  // Popular genres first — page 0 is newest, deeper pages are older catalog.
+  for (const slug of CRAWL_GENRES) {
+    for (const offset of [0, 24, 48, 96, 192]) tasks.push({ type: 'genre', slug, offset })
+  }
+  for (const slug of CRAWL_COUNTRIES) {
+    for (const offset of [0, 24, 48]) tasks.push({ type: 'country', slug, offset })
+  }
+  // Year pages fill in older, often much better-rated classics.
+  const thisYear = new Date().getFullYear()
+  for (let year = thisYear; year >= 1960; year -= 1) {
+    tasks.push({ type: 'year', slug: String(year), offset: 0 })
+  }
+  return tasks
+}
+
+let crawlPromise = null
+
+/**
+ * Walk CircleFTP listings and learn real IMDb ratings for as many titles as we
+ * can, at a gentle, steady pace. Runs once per process, results persist to disk.
+ */
+export function startCrawl({ max = Number(process.env.CRAWL_MAX || 4000) } = {}) {
+  if (crawlPromise) return crawlPromise
+  if (IS_SERVERLESS || process.env.CRAWL_ENABLED === '0') return Promise.resolve(0)
+
+  crawlPromise = (async () => {
+    crawlState.running = true
+    crawlState.startedAt = Date.now()
+    crawlState.target = max
+
+    const queue = []
+    let producersDone = false
+    let fetched = 0
+
+    const detailWorkers = Array.from({ length: 4 }, async () => {
+      for (;;) {
+        if (!queue.length) {
+          if (producersDone || fetched >= max) return
+          await sleep(200)
+          continue
+        }
+        if (fetched >= max) return
+        const slug = queue.shift()
+        const known = qualityIndex.get(slug)
+        if (known && Date.now() - known.at < INDEX_TTL) continue
+        try {
+          await getDetail(slug)
+          fetched += 1
+          crawlState.fetched = fetched
+          if (fetched % 100 === 0) {
+            saveIndexNow()
+            console.log(`[index] crawled ${fetched}/${max} titles (${qualityIndex.size} known)`)
+          }
+        } catch {
+          /* skip unavailable titles */
+        }
+      }
+    })
+
+    const tasks = buildCrawlTasks()
+    let cursor = 0
+
+    // Year pages are fetched through the generic listing helper below.
+    const loadTask = async (task) => {
+      if (task.type === 'year') {
+        const html = await fetchPage(`/year/${task.slug}.html`)
+        return { items: parseList(html) }
+      }
+      return getListing(task.type, task.slug, task.offset)
+    }
+
+    const listingWorkers = Array.from({ length: 3 }, async () => {
+      while (cursor < tasks.length && fetched < max) {
+        if (queue.length > 500) {
+          await sleep(250)
+          continue
+        }
+        const task = tasks[cursor++]
+        try {
+          const page = await loadTask(task)
+          crawlState.pages += 1
+          for (const item of page.items || []) {
+            const known = qualityIndex.get(item.slug)
+            if (known && Date.now() - known.at < INDEX_TTL) continue
+            queue.push(item.slug)
+          }
+        } catch {
+          /* ignore unreachable listing */
+        }
+      }
+    })
+
+    await Promise.all(listingWorkers)
+    producersDone = true
+    await Promise.all(detailWorkers)
+
+    crawlState.running = false
+    crawlState.finishedAt = Date.now()
+    saveIndexNow()
+    console.log(`[index] crawl finished — ${qualityIndex.size} titles known`)
+    return fetched
+  })()
+
+  return crawlPromise
 }
 
 export const catalogMeta = { base: BASE }

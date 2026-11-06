@@ -4,7 +4,7 @@ import { aiProviderLabel, api, imgSrc, prettyTitle } from '../lib/api'
 import { useMemory } from '../lib/memory'
 import { detectProfile, GROUP_PROFILE, GROUP_PROFILE_ID, profileById } from '../lib/profiles'
 import { playSound } from '../lib/sfx'
-import { speak, stopSpeaking } from '../lib/speech'
+import { speak, stopSpeaking, useVoiceRecognition } from '../lib/speech'
 import type { AiPick, AiResult, CatalogItem, Detail, HomeData } from '../types'
 import { AskBar } from '../components/AskBar'
 import { DetailModal } from '../components/DetailModal'
@@ -34,6 +34,61 @@ const CHIPS = [
   { label: 'Family night', prompt: 'Find something family-friendly we can watch together.' },
   { label: 'Something new', prompt: "Show me something new I haven't watched yet." },
 ]
+
+/* ────────────────────────── welcome greeting ────────────────────────── */
+
+type DayPart = 'morning' | 'afternoon' | 'evening' | 'night'
+
+function dayPart(hour: number): DayPart {
+  if (hour >= 5 && hour < 12) return 'morning'
+  if (hour >= 12 && hour < 17) return 'afternoon'
+  if (hour >= 17 && hour < 22) return 'evening'
+  return 'night'
+}
+
+const GREETINGS: Record<DayPart, { hello: string; lines: string[] }> = {
+  morning: {
+    hello: 'Good morning',
+    lines: [
+      'Aj ke amra ki movie dekhbo?',
+      'Cholo aj notun kichu explore kora jak.',
+      'Cha ar ekta bhalo cinema — perfect shuru.',
+      'Sokal bela ekta hasir movie hobe?',
+    ],
+  },
+  afternoon: {
+    hello: 'Good afternoon',
+    lines: [
+      'Dupur er pore ekta light movie hobe?',
+      'Aj ki comedy dekhi naki thriller?',
+      'Cholo aj notun kichu explore kora jak.',
+      'Bikel bela ekta family movie perfect.',
+    ],
+  },
+  evening: {
+    hello: 'Good evening',
+    lines: [
+      'Aj raate ki dekhte chao?',
+      'Movie night ready? Bolo, ami khuje dibo.',
+      'Aj ekta notun golpo dekha jak.',
+      'Aj ke amra ki movie dekhbo?',
+    ],
+  },
+  night: {
+    hello: 'Good night',
+    lines: [
+      'Ekhono ghum ashe ni? Ekta movie dekhe nei.',
+      'Raat er shanti te ekta bhalo cinema.',
+      'Aj ke amra ki movie dekhbo?',
+      'Cholo aj notun kichu explore kora jak.',
+    ],
+  },
+}
+
+function welcomeFor(period: DayPart, attempt = 0) {
+  const pick = GREETINGS[period]
+  return pick.lines[attempt % pick.lines.length]
+}
 
 function PickCard({
   pick,
@@ -147,6 +202,14 @@ export function HomePage() {
   const ranSimilar = useRef('')
   const lastQueryRef = useRef('')
   const lastPicksRef = useRef<AiPick[]>([])
+  const threadRef = useRef<{ role: 'user' | 'assistant'; text: string }[]>([])
+  const avoidedRef = useRef<string[]>([])
+  const [threadLen, setThreadLen] = useState(0)
+
+  const [period] = useState<DayPart>(() => dayPart(new Date().getHours()))
+  const [welcomeIndex, setWelcomeIndex] = useState(() => Math.floor(Math.random() * 4))
+  const welcome = GREETINGS[period]
+  const welcomeLine = welcomeFor(period, welcomeIndex)
 
   const loadHome = useCallback(async () => {
     setHomeLoading(true)
@@ -180,12 +243,21 @@ export function HomePage() {
 
   useEffect(() => () => stopSpeaking(), [])
 
+  const speakReply = useCallback(() => {
+    if (!ai?.reply) return
+    const bangla = memory.prefs.voiceLang === 'bn' && Boolean(ai.replyBn)
+    speak(bangla ? ai.replyBn! : ai.reply, {
+      lang: bangla ? 'bn' : 'en',
+      gender: memory.prefs.voiceGender,
+    })
+  }, [ai, memory.prefs.voiceGender, memory.prefs.voiceLang])
+
   useEffect(() => {
     if (ai?.reply && memory.prefs.tts && spokenRef.current !== ai.reply) {
       spokenRef.current = ai.reply
-      speak(ai.reply)
+      speakReply()
     }
-  }, [ai, memory.prefs.tts])
+  }, [ai, memory.prefs.tts, speakReply])
 
   const ask = useCallback(
     async (text: string) => {
@@ -209,35 +281,48 @@ export function HomePage() {
           : profileById(effectiveTarget, memory.profiles).name
       setTargetName(name)
 
-      // Refinements like "not this type" or "more like these" reuse the last
-      // request and tell the server to avoid titles already on screen.
-      const previousQuery = lastQueryRef.current
-      const refineRe =
-        /^(not (this|these|that)|something (else|different)|different (type|kind)|another (type|kind)|more like|show me more|more picks|try again|try something|no[, ]+(i|we)?\s*(need|want)|change (the )?(type|country|language|genre))/i
-      const refining = Boolean(previousQuery) && refineRe.test(text.trim())
-      let requestMessage = text
-      let avoidSlugs: string[] = []
-
-      if (refining) {
-        const titles = lastPicksRef.current.map((p) => p.title).filter(Boolean).join('; ')
-        const wantsMore = /more like|similar|same/i.test(text)
-        requestMessage = wantsMore
-          ? `Original request: ${previousQuery}. The viewer liked these picks: ${titles}. Recommend more titles in the same style, but different titles.`
-          : `Original request: ${previousQuery}. The viewer said "${text}". Do not recommend any of these again: ${titles}. Suggest a clearly different type of title.`
-        avoidSlugs = lastPicksRef.current.map((p) => p.slug)
+      // ── conversation state ──────────────────────────────────────────────
+      // After the first answer, every new message is treated as feedback on it
+      // ("no brother, I don't like these — update a bit"). The server gets the
+      // whole thread plus the previous request as topic, so vague feedback still
+      // produces relevant alternatives. A message that clearly names a new genre
+      // or country starts a fresh conversation instead.
+      const namesNewTopic =
+        /\b(korean|japanese|chinese|tamil|telugu|malayalam|turkish|thai|hindi|english|french|spanish|german|action|comedy|thriller|horror|romance|drama|family|animated|animation|documentary|series|anime|biopic|sci-fi|fantasy)\b/i.test(
+          text,
+        ) || text.trim().split(/\s+/).length > 16
+      const continuing = Boolean(ai && ai.picks?.length) && !namesNewTopic
+      if (ai && !continuing) {
+        // Fresh topic: forget the old thread so it cannot leak into this answer.
+        threadRef.current = []
+        avoidedRef.current = []
       }
+      const previousQuery = lastQueryRef.current
+      const currentPicks = ai?.picks || []
+      const avoidSlugs = continuing
+        ? [...new Set([...avoidedRef.current, ...currentPicks.map((p) => p.slug)])]
+        : []
 
       try {
         const result = await api.recommend({
-          message: requestMessage,
+          message: text,
+          topic: continuing ? previousQuery : undefined,
           memory: snapshot?.memory ?? memory.memorySummary(),
           prefs: snapshot?.prefs ?? memory.prefs,
           targetName: name,
           avoidSlugs,
+          history: threadRef.current.slice(-8),
         })
         setAi(result)
-        lastQueryRef.current = refining ? previousQuery : text
+        lastQueryRef.current = continuing ? previousQuery : text
         lastPicksRef.current = result.picks || []
+        avoidedRef.current = avoidSlugs
+        threadRef.current = [
+          ...threadRef.current,
+          { role: 'user' as const, text },
+          { role: 'assistant' as const, text: result.reply || '' },
+        ].slice(-10)
+        setThreadLen(threadRef.current.length)
         playSound('success')
         if (!memory.prefs.tts) stopSpeaking()
       } catch (err) {
@@ -248,7 +333,7 @@ export function HomePage() {
         setAiBusy(false)
       }
     },
-    [memory],
+    [memory, ai],
   )
 
   // "Find similar" links arrive as /?similar=slug from other pages.
@@ -306,6 +391,22 @@ export function HomePage() {
     [ask, runSearch],
   )
 
+  // Voice feedback: after results are shown the viewer can simply talk.
+  const feedbackVoice = useVoiceRecognition({
+    lang: 'en-IN',
+    onFinal: (transcript) => {
+      void ask(transcript)
+    },
+  })
+
+  const resetConversation = useCallback(() => {
+    threadRef.current = []
+    avoidedRef.current = []
+    lastQueryRef.current = ''
+    lastPicksRef.current = []
+    setThreadLen(0)
+  }, [])
+
   useEffect(() => {
     const onBack = () => {
       if (selected) return // handled by the modal itself
@@ -314,12 +415,13 @@ export function HomePage() {
         setAiError(null)
         setSearch(null)
         setTargetName(null)
+        resetConversation()
         stopSpeaking()
       }
     }
     document.addEventListener('tv-back', onBack)
     return () => document.removeEventListener('tv-back', onBack)
-  }, [ai, aiError, search, selected])
+  }, [ai, aiError, search, selected, resetConversation])
 
   const rankByTaste = useCallback(
     (items: CatalogItem[]): CatalogItem[] => {
@@ -374,6 +476,30 @@ export function HomePage() {
       <section className="pb-2 pt-5 md:pt-7">
         <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
           <div>
+            <div className="mb-2 flex flex-wrap items-center gap-2">
+              <span className="rounded-full bg-gold/15 px-2.5 py-1 text-[0.62rem] font-bold uppercase tracking-[0.14em] text-gold">
+                {welcome.hello}
+                {memory.profileName ? `, ${memory.profileName}` : ''}
+              </span>
+              <button
+                type="button"
+                data-nav
+                onClick={() => setWelcomeIndex((i) => i + 1)}
+                className="text-sm text-white/55 transition hover:text-white"
+                title="Show another line"
+              >
+                {welcomeLine} <span className="text-white/25">↻</span>
+              </button>
+              <button
+                type="button"
+                data-nav
+                onClick={() => speak(`${welcome.hello}. ${welcomeLine}`, { lang: 'en', gender: memory.prefs.voiceGender })}
+                className="btn-ghost !p-1.5"
+                aria-label="Read the greeting aloud"
+              >
+                <SpeakerIcon width={14} height={14} />
+              </button>
+            </div>
             <h2 className="max-w-3xl text-2xl font-black leading-[1.1] tracking-tight md:text-4xl">
               What should we{' '}
               <span className="bg-gradient-to-r from-brand via-brand-soft to-gold bg-clip-text text-transparent">
@@ -454,7 +580,7 @@ export function HomePage() {
               <button
                 type="button"
                 data-nav
-                onClick={() => speak(ai.reply)}
+                onClick={speakReply}
                 className="btn-ghost !p-2"
                 title="Read aloud"
                 aria-label="Read reply aloud"
@@ -466,6 +592,7 @@ export function HomePage() {
                 data-nav
                 onClick={() => {
                   setAi(null)
+                  resetConversation()
                   stopSpeaking()
                 }}
                 className="btn-ghost !p-2"
@@ -499,14 +626,72 @@ export function HomePage() {
 
           {ai.picks.length ? (
             <div className="mt-4 rounded-2xl border border-white/10 bg-black/25 p-3">
-              <p className="mb-2 text-[0.68rem] font-bold uppercase tracking-wider text-white/35">
-                Not quite right? Refine it
-              </p>
-              <div className="flex flex-wrap gap-2">
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <p className="text-[0.68rem] font-bold uppercase tracking-wider text-white/35">
+                  Keep talking — say what to change
+                </p>
+                {threadLen > 0 ? (
+                  <span className="rounded-full bg-white/[0.06] px-2 py-0.5 text-[0.6rem] text-white/35">
+                    {Math.ceil(threadLen / 2)} turn{threadLen > 2 ? 's' : ''} in this chat
+                  </span>
+                ) : null}
+              </div>
+
+              <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-black/40 p-1.5 focus-within:border-gold/50">
+                <input
+                  id="feedback-input"
+                  data-nav
+                  placeholder='“No brother, I don’t like these — update a bit”'
+                  className="min-w-0 flex-1 bg-transparent px-2 py-2.5 text-sm text-white placeholder:text-white/25"
+                  onKeyDown={(e) => {
+                    if (e.key !== 'Enter') return
+                    const value = (e.target as HTMLInputElement).value.trim()
+                    if (!value) return
+                    ;(e.target as HTMLInputElement).value = ''
+                    void ask(value)
+                  }}
+                />
+                {feedbackVoice.supported ? (
+                  <button
+                    type="button"
+                    data-nav
+                    onClick={() => {
+                      stopSpeaking()
+                      if (feedbackVoice.listening) feedbackVoice.stop()
+                      else feedbackVoice.start()
+                    }}
+                    className={`flex items-center gap-2 rounded-lg px-3 py-2 text-xs font-bold transition ${
+                      feedbackVoice.listening
+                        ? 'animate-pulseSoft bg-brand text-white'
+                        : 'border border-white/10 bg-white/[0.06] text-white/80 hover:bg-white/[0.12]'
+                    }`}
+                    aria-label="Speak your feedback"
+                  >
+                    <SparkIcon width={14} height={14} />
+                    {feedbackVoice.listening ? 'Listening…' : 'Voice'}
+                  </button>
+                ) : null}
                 <button
                   type="button"
                   data-nav
-                  onClick={() => ask('Not this type — show something different')}
+                  onClick={() => {
+                    const input = document.getElementById('feedback-input') as HTMLInputElement | null
+                    const value = input?.value.trim()
+                    if (!value) return
+                    input!.value = ''
+                    void ask(value)
+                  }}
+                  className="btn-primary !px-4 !py-2 text-xs"
+                >
+                  Send
+                </button>
+              </div>
+
+              <div className="mt-2 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  data-nav
+                  onClick={() => void ask('No, I do not like these. Show me something different.')}
                   className="chip !text-xs"
                 >
                   Not this type
@@ -514,7 +699,7 @@ export function HomePage() {
                 <button
                   type="button"
                   data-nav
-                  onClick={() => ask('More like these, but different titles')}
+                  onClick={() => void ask('More like these, but different titles.')}
                   className="chip !text-xs"
                 >
                   More like these
@@ -522,16 +707,33 @@ export function HomePage() {
                 <button
                   type="button"
                   data-nav
-                  onClick={() => ask('Change the language or country — show something different')}
+                  onClick={() => void ask('These are too serious. Something lighter and more fun.')}
                   className="chip !text-xs"
                 >
-                  Different language
+                  Lighter
+                </button>
+                <button
+                  type="button"
+                  data-nav
+                  onClick={() => void ask('Show me better rated ones — 7 and above.')}
+                  className="chip !text-xs"
+                >
+                  Higher rated
                 </button>
               </div>
-              <p className="mt-2 text-[0.65rem] text-white/25">
-                You can also say “no, I need this type” with Voice — the AI remembers your last
-                request.
-              </p>
+
+              {feedbackVoice.listening ? (
+                <p className="mt-2 text-xs text-brand-soft">
+                  Listening… {feedbackVoice.interim ? <span className="text-white/60">“{feedbackVoice.interim}”</span> : 'say what you want changed'}
+                </p>
+              ) : feedbackVoice.error ? (
+                <p className="mt-2 text-xs text-amber-300/90">{feedbackVoice.error}</p>
+              ) : (
+                <p className="mt-2 text-[0.65rem] text-white/25">
+                  The AI remembers this whole conversation. Say “these are boring”, “more like the second
+                  one”, or “something Korean instead” — it will re-pick without repeating titles.
+                </p>
+              )}
             </div>
           ) : null}
 
@@ -551,9 +753,10 @@ export function HomePage() {
             </div>
           ) : null}
 
-          <p className="mt-4 flex items-center gap-1.5 text-[0.65rem] text-white/25">
+          <p className="mt-4 flex flex-wrap items-center gap-1.5 text-[0.65rem] text-white/25">
             <CheckIcon width={12} height={12} />
             {ai.candidates ? `${ai.candidates} verified catalog titles considered · ` : ''}
+            {ai.avgRating ? `average IMDb ${ai.avgRating.toFixed(1)} · ` : ''}
             availability from CircleFTP · audio details are honest, not guesses
           </p>
         </section>

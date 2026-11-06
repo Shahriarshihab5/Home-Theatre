@@ -29,7 +29,13 @@ import type {
   WatchlistEntry,
 } from '../types'
 
-const DEFAULT_PREFS: Prefs = { preferHindi: true, familyOnly: false, tts: true }
+const DEFAULT_PREFS: Prefs = {
+  preferHindi: true,
+  familyOnly: false,
+  tts: true,
+  voiceLang: 'en',
+  voiceGender: 'female',
+}
 const EMPTY_TASTE: Taste = { genres: {}, countries: {} }
 
 interface RateTarget extends CatalogItem {
@@ -323,6 +329,8 @@ export function MemoryProvider({ children }: { children: ReactNode }) {
       preferHindi: list.some((p) => p.preferHindi),
       familyOnly: list.every((p) => p.familyOnly),
       tts: list.some((p) => p.tts),
+      voiceLang: list[0]?.voiceLang ?? DEFAULT_PREFS.voiceLang,
+      voiceGender: list[0]?.voiceGender ?? DEFAULT_PREFS.voiceGender,
     }
   }, [profiles, prefsAll])
 
@@ -568,6 +576,8 @@ export function MemoryProvider({ children }: { children: ReactNode }) {
               preferHindi: prefList.some((p) => p.preferHindi),
               familyOnly: prefList.every((p) => p.familyOnly),
               tts: prefList.some((p) => p.tts),
+              voiceLang: prefList[0]?.voiceLang ?? DEFAULT_PREFS.voiceLang,
+              voiceGender: prefList[0]?.voiceGender ?? DEFAULT_PREFS.voiceGender,
             }
           : DEFAULT_PREFS
 

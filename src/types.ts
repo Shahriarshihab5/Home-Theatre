@@ -35,10 +35,17 @@ export interface Detail extends CatalogItem {
   itemId?: string
 }
 
+export type VoiceLang = 'en' | 'bn'
+export type VoiceGender = 'female' | 'male'
+
 export interface Prefs {
   preferHindi: boolean
   familyOnly: boolean
   tts: boolean
+  /** Spoken-reply language; the on-screen text stays English. */
+  voiceLang: VoiceLang
+  /** Preferred speech-synthesis voice. */
+  voiceGender: VoiceGender
 }
 
 export interface RatingEntry {
@@ -88,6 +95,8 @@ export interface AiPick extends CatalogItem {
 
 export interface AiResult {
   reply: string
+  /** Bengali spoken summary used when the voice language is Bangla. */
+  replyBn?: string
   picks: AiPick[]
   followups: string[]
   source: 'ai' | 'local'
@@ -95,7 +104,39 @@ export interface AiResult {
   provider?: string
   targetName?: string
   candidates?: number
+  avgRating?: number | null
+  ratedCount?: number
+  qualityFiltered?: boolean
   aiError?: string
+}
+
+export interface StreamTrack {
+  ordinal: number
+  streamIndex: number
+  lang: string
+  language: string
+  codec: string
+  codecLabel: string
+  channels: string
+  browserSafe: boolean
+  isDefault: boolean
+}
+
+export interface StreamInfo {
+  slug: string
+  source: string
+  transcode: boolean
+  filenameAudio: AudioInfo | null
+  downloadUrl: string
+  watchUrl: string
+  info: {
+    durationSec: number | null
+    video: { streamIndex: number; codec: string; width: number | null; height: number | null; browserSafe: boolean } | null
+    audio: StreamTrack[]
+    subtitles: { streamIndex: number; lang: string; language: string; codec: string }[]
+    directPlayable: boolean
+    audioNeedsRemux: boolean
+  } | null
 }
 
 export interface HomeData {
