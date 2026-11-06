@@ -308,7 +308,7 @@ home-movie-theatre/
 | `GET /api/stream-info?slug=...` | ffmpeg probe: real audio/subtitle tracks and codecs. |
 | `GET /api/play?slug=...&a=<track>&t=<seconds>` | Remuxed MP4 stream (video copy, AAC audio). |
 | `GET /api/similar?slug=...` | Recommendations like a given title. |
-| `POST /api/ai/recommend` | `{ message, memory, prefs, targetName?, avoidSlugs?, history?, topic? }` - grounded picks. |
+| `POST /api/recommend` | `{ message, memory, prefs, targetName?, avoidSlugs?, history?, topic? }` - grounded picks. `/api/ai/recommend` is kept as an alias. |
 | `GET /api/tmdb?title=...&year=...` | Optional metadata enrichment. |
 | `GET /api/image?url=...` | Poster proxy for allow-listed hosts (used when no bundled poster exists). |
 

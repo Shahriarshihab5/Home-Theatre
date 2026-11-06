@@ -221,7 +221,9 @@ app.get(
 )
 
 app.post(
-  '/api/ai/recommend',
+  // `/api/recommend` is the one-segment alias: Vercel's catch-all function does
+  // not route nested API paths like `/api/ai/recommend` on this deployment.
+  ['/api/ai/recommend', '/api/recommend'],
   rateLimit(30, 10 * 60 * 1000),
   wrap(async (req, res) => {
     const { message, memory, prefs, referenceSlug, targetName, avoidSlugs, history, topic } = req.body || {}

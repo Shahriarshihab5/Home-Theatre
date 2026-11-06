@@ -52,7 +52,7 @@ export const api = {
     topic?: string
     history?: { role: 'user' | 'assistant'; text: string }[]
   }) =>
-    getJSON<AiResult>('/api/ai/recommend', {
+    getJSON<AiResult>('/api/recommend', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
