@@ -58,6 +58,18 @@ const OPENROUTER_BASE = () =>
 const OPENROUTER_MODEL = () =>
   process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-ultra-550b-a55b:free'
 
+/**
+ * How much of the work the AI does.
+ *
+ *   intent (default) — the AI only reads the request and writes a short
+ *     acknowledgement. The app searches its own catalog and ranks the picks.
+ *     This costs roughly a tenth of the tokens of the old flow, so a free
+ *     Gemini/Groq quota lasts far longer, and a dead AI still leaves good picks.
+ *   full — the older flow: the AI sees every candidate title and chooses.
+ *   off — never call an AI provider (same as AI_PROVIDER=local).
+ */
+const AI_MODE = () => (process.env.AI_MODE || 'intent').toLowerCase()
+
 function stripModelsPrefix(model) {
   return String(model || '').replace(/^models\//, '')
 }
@@ -241,6 +253,11 @@ const GENRE_PATTERNS = {
   biography: /biograph/i,
   war: /^war/i,
   history: /history/i,
+  sport: /sport/i,
+  music: /music/i,
+  musical: /musical/i,
+  western: /western/i,
+  documentary: /document/i,
   'tv-show': /tv|series|soap/i,
 }
 
@@ -257,13 +274,79 @@ const COUNTRY_PATTERNS = {
   'south-korea': /korea/i,
 }
 
+/** Country name (as a viewer or the AI says it) → CircleFTP listing slug. */
+const COUNTRY_SLUGS = {
+  korea: 'south-korea',
+  'south korea': 'south-korea',
+  'south-korea': 'south-korea',
+  korean: 'south-korea',
+  india: 'india',
+  indian: 'india',
+  bollywood: 'india',
+  usa: 'usa',
+  'united states': 'usa',
+  america: 'usa',
+  american: 'usa',
+  hollywood: 'usa',
+  uk: 'uk',
+  britain: 'uk',
+  british: 'uk',
+  'united kingdom': 'uk',
+  england: 'uk',
+  japan: 'japan',
+  japanese: 'japan',
+  china: 'china',
+  chinese: 'china',
+  thailand: 'thailand',
+  thai: 'thailand',
+  turkey: 'turkey',
+  turkish: 'turkey',
+  tamil: 'tamil',
+  iran: 'iran',
+  iranian: 'iran',
+  spain: 'spain',
+  spanish: 'spain',
+  france: 'france',
+  french: 'france',
+  germany: 'germany',
+  german: 'germany',
+  russia: 'russia',
+  russian: 'russia',
+  indonesia: 'indonesia',
+  indonesian: 'indonesia',
+  philippines: 'philippines',
+  'hong kong': 'hong-kong',
+}
+
+function countrySlug(name) {
+  const key = String(name || '').toLowerCase().replace(/\s+/g, ' ').trim()
+  if (!key) return ''
+  if (COUNTRY_SLUGS[key]) return COUNTRY_SLUGS[key]
+  return key.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+}
+
+/** Build a matcher for any country slug, including ones not in the table. */
+function countryPattern(slug) {
+  if (!slug) return null
+  if (COUNTRY_PATTERNS[slug]) return COUNTRY_PATTERNS[slug]
+  const words = String(slug).split(/[-_]+/).filter(Boolean)
+  if (!words.length) return null
+  return new RegExp(words.join('[ -]?'), 'i')
+}
+
+/** Does this candidate belong to the requested country? */
+function inCountry(country, slug) {
+  const re = countryPattern(slug)
+  if (!re) return false
+  return re.test(String(country || ''))
+}
+
 function relevanceFor(entry, segments, words) {
   let score = 0
   for (const seg of segments) {
     if (seg.filler) continue
     if (seg.type === 'country') {
-      const re = COUNTRY_PATTERNS[seg.slug]
-      if (re && re.test(entry.country || '')) score += 10
+      if (inCountry(entry.country, seg.slug)) score += 10
     } else {
       const re = GENRE_PATTERNS[seg.slug]
       if (re && (entry.genres || []).some((g) => re.test(g))) score += 7
@@ -344,18 +427,52 @@ function rankCandidates(candidates) {
     .map(({ c }) => c)
 }
 
-async function gatherCandidates(message, { referenceSlug } = {}) {
+async function gatherCandidates(
+  message,
+  { referenceSlug, intent = null, person: personHint, explicit = null } = {},
+) {
   const segments = matchSegments(message)
+  // What the viewer actually said, without any words the AI added. An explicit
+  // genre in the request must win over genres the model merely inferred.
+  const explicitSegments = explicit || segments
+
+  // The AI ("intent mode") can name a genre or country the viewer phrased
+  // indirectly ("something like a Scandi noir"). Add those as real listings so
+  // the local search reaches them even when the raw words did not match.
+  if (intent) {
+    for (const genre of intent.genres || []) {
+      if (!segments.some((seg) => seg.type === 'genre' && seg.slug === genre)) {
+        segments.unshift({ type: 'genre', slug: genre })
+      }
+    }
+    for (const country of intent.countries || []) {
+      const slug = countrySlug(country)
+      if (slug && !segments.some((seg) => seg.type === 'country' && seg.slug === slug)) {
+        segments.unshift({ type: 'country', slug })
+      }
+    }
+  }
 
   // Actor lookups need a network round-trip; run them first and, when the
   // person is known, answer only from their verified filmography. That is both
   // correct (no padding) and much faster than scanning the whole catalog.
-  const person = await resolvePersonInQuery(message).catch(() => null)
+  // The caller may pass a person resolved from the viewer's own words — the AI's
+  // guesses are never allowed to decide who an actor is.
+  const person =
+    personHint !== undefined
+      ? personHint
+      : await resolvePersonInQuery(message).catch(() => null)
   if (person) {
-    const personGenres = segments
-      .filter((seg) => seg.type === 'genre' && !seg.filler)
-      .map((seg) => seg.slug)
-    const personCountries = segments.filter((seg) => seg.type === 'country').map((seg) => seg.slug)
+    const genresOf = (list) =>
+      list.filter((seg) => seg.type === 'genre' && !seg.filler).map((seg) => seg.slug)
+    const countriesOf = (list) => list.filter((seg) => seg.type === 'country').map((seg) => seg.slug)
+    const explicitGenres = genresOf(explicitSegments)
+    const aiGenres = genresOf(segments)
+    // OR semantics: "Aamir Khan sports drama" keeps both, but an AI guess like
+    // "drama" can never widen a request that only said "sports".
+    const personGenres = explicitGenres.length ? explicitGenres : aiGenres
+    const explicitCountries = countriesOf(explicitSegments)
+    const personCountries = explicitCountries.length ? explicitCountries : countriesOf(segments)
     const actorItems = matchPersonFilms(person.films, {
       genres: personGenres,
       countries: personCountries,
@@ -386,15 +503,25 @@ async function gatherCandidates(message, { referenceSlug } = {}) {
   const pages = []
 
   // Free-text search often catches the exact title the user mentions.
-  const words = String(message)
+  const words = `${String(message)} ${(intent?.search || []).join(' ')}`
     .toLowerCase()
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .split(/\s+/)
     .filter((w) => w.length > 2 && !STOPWORDS.has(w))
-    .slice(0, 6)
+    .slice(0, 8)
 
   const searches = []
-  if (words.length) searches.push(words.join(' '))
+  // Phrases proposed by the AI come first: they are the whole point of intent
+  // mode. An invented title simply returns nothing and can never reach a pick.
+  for (const phrase of intent?.search || []) {
+    const clean = String(phrase).toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 60)
+    if (clean && !searches.includes(clean)) searches.push(clean)
+    if (searches.length >= 4) break
+  }
+  if (words.length) {
+    const phrase = words.join(' ')
+    if (!searches.includes(phrase)) searches.push(phrase)
+  }
   // Individual words help when a phrase like "village thriller" matches
   // nothing as a whole but "village" exists as a title keyword.
   const GENERIC_WORDS = new Set(['family', 'comedy', 'action', 'drama', 'horror', 'romance', 'animation', 'kids'])
@@ -404,7 +531,7 @@ async function gatherCandidates(message, { referenceSlug } = {}) {
   }
 
   const searchPages = await Promise.all(
-    searches.slice(0, 4).map(async (q) => {
+    searches.slice(0, 5).map(async (q) => {
       const s = await searchCatalog(q).catch(() => null)
       return s && s.items?.length ? { ...s, label: `search: "${q}"` } : null
     }),
@@ -710,7 +837,9 @@ async function callGeminiOnce(model, system, user, { withThinking }) {
   const content = parts.map((p) => p?.text || '').join('').trim()
   const usage = data?.usageMetadata || {}
   console.log(
-    `[ai] ${model} ok in ${Date.now() - startedAt}ms (${content.length} chars, finish=${data?.candidates?.[0]?.finishReason}, out=${usage.candidatesTokenCount ?? '?'}, think=${usage.thoughtsTokenCount ?? 0})`,
+    `[ai] ${model} ok in ${Date.now() - startedAt}ms (in=${usage.promptTokenCount ?? '?'}, out=${
+      usage.candidatesTokenCount ?? '?'
+    }, think=${usage.thoughtsTokenCount ?? 0}, finish=${data?.candidates?.[0]?.finishReason})`,
   )
   if (!content) {
     const blocked = data?.promptFeedback?.blockReason
@@ -872,20 +1001,236 @@ function parseJsonLoose(content) {
   }
 }
 
+/* ── intent mode ─────────────────────────────────────────────────────────
+ * The AI reads the request; the app does the searching. No candidate list is
+ * sent, so the prompt is a few hundred tokens instead of several thousand.
+ * The AI cannot add a title because it never returns titles — every card on
+ * screen comes from a CircleFTP search.
+ * ---------------------------------------------------------------------- */
+
+const INTENT_GENRES = new Set([
+  'action', 'adventure', 'animation', 'biography', 'comedy', 'crime', 'documentary', 'drama',
+  'family', 'fantasy', 'history', 'horror', 'music', 'musical', 'mystery', 'romance', 'sci-fi',
+  'sport', 'thriller', 'war', 'western',
+])
+
+function buildIntentPrompt({ message, memory, prefs, targetName, history = [], topic = '' }) {
+  const wantsBanglaVoice = prefs?.voiceLang === 'bn'
+  const conversation = (Array.isArray(history) ? history : [])
+    .filter((turn) => turn && turn.text)
+    .slice(-6)
+    .map(
+      (turn) =>
+        `${turn.role === 'assistant' ? 'You' : 'Viewer'}: ${String(turn.text).slice(0, 240)}`,
+    )
+    .join('\n')
+  const tasteGenres = Object.entries(memory?.taste?.genres || {})
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
+    .map(([genre]) => genre)
+  const tasteCountries = Object.entries(memory?.taste?.countries || {})
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 4)
+    .map(([country]) => country)
+
+  const schema = `{
+  "search": [string],
+  "genres": [string],
+  "countries": [string],
+  "languages": [string],
+  "person": string|null,
+  "yearFrom": number|null,
+  "yearTo": number|null,
+  "wantsSeries": boolean,
+  "mood": string,
+  "reply": string${wantsBanglaVoice ? ',\n  "replyBn": string' : ''}
+}`
+
+  const system = `You are the request reader for "Home Movie Theatre", a Smart TV app that owns a verified CircleFTP movie catalog.
+You NEVER choose, name or promise movies. A separate local engine searches the catalog and attaches the titles. Your only job is to describe what the viewer wants and to write one short spoken acknowledgement.
+
+Return STRICT JSON only, matching:
+${schema}
+
+FIELDS
+- search: up to 4 short phrases the app will run against its own catalog. Use words the viewer actually said plus standard genre/country vocabulary. NEVER invent a movie title and never add a title the viewer did not say.
+- genres: only from action, adventure, animation, biography, comedy, crime, documentary, drama, family, fantasy, history, horror, music, mystery, romance, sci-fi, sport, thriller, war, western. List ONLY genres the viewer explicitly asked for or a direct synonym. Do not add genres you merely infer are typical (for example, do not add "drama" or "biography" to a sports request).
+- countries: only what the viewer clearly asked for (e.g. Korea, India, USA, Japan, Turkey, Thailand, China, UK, France).
+- languages: only what the viewer clearly asked for (e.g. Hindi, Korean, English, Tamil, Japanese, Turkish).
+- person: actor or director the viewer named, else null.
+- yearFrom / yearTo: only when the viewer names a year or decade, else null.
+- wantsSeries: true only when the viewer asks for a web series, TV show, season or episodes.
+- mood: 2-5 words, e.g. "tense revenge thriller".
+- reply: 1-2 warm, TV-friendly sentences that acknowledge the request and mention the theme, country or mood. Do NOT name titles. Do NOT promise availability.
+${wantsBanglaVoice ? '- replyBn: the same acknowledgement in conversational Bengali script (বাংলা), 1-2 short sentences. No transliteration and no English sentences.' : ''}
+
+RULES
+- An explicit country or language in the request overrides any saved Hindi preference.
+- If the latest message is feedback on previous picks ("no", "not these", "something else"), keep the original topic and read the feedback as a direction. Never repeat old titles in "search".
+- Never invent titles, ratings or availability.
+- Keep every list short. An empty array is correct when the viewer said nothing about it.
+
+VIEWER
+${
+  targetName === 'Everyone'
+    ? 'The whole household is watching together.'
+    : targetName
+      ? `This is for ${targetName}.`
+      : 'Active profile.'
+}
+Saved taste genres: ${tasteGenres.length ? tasteGenres.join(', ') : 'unknown'}
+Saved taste countries: ${tasteCountries.length ? tasteCountries.join(', ') : 'unknown'}
+Saved Hindi preference: ${prefs?.preferHindi ? 'yes' : 'no'}
+Family mode: ${prefs?.familyOnly ? 'on' : 'off'}
+${topic ? `Current topic from earlier turns: ${String(topic).slice(0, 300)}` : ''}
+${conversation ? `\nCONVERSATION SO FAR\n${conversation}` : ''}`
+
+  return [
+    { role: 'system', content: system },
+    { role: 'user', content: String(message || '') },
+  ]
+}
+
+function cleanList(value, limit) {
+  if (!Array.isArray(value)) return []
+  const seen = new Set()
+  const out = []
+  for (const raw of value) {
+    const text = String(raw ?? '').replace(/\s+/g, ' ').trim().slice(0, 48)
+    if (!text) continue
+    const key = text.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(text)
+    if (out.length >= limit) break
+  }
+  return out
+}
+
+function cleanYear(value) {
+  const year = Number(value)
+  return Number.isFinite(year) && year >= 1900 && year <= 2100 ? Math.round(year) : null
+}
+
+function normalizeIntent(parsed) {
+  const genres = cleanList(parsed?.genres, 4)
+    .map((genre) => genre.toLowerCase().replace(/\s+/g, '-'))
+    .filter((genre) => INTENT_GENRES.has(genre))
+  const countries = cleanList(parsed?.countries, 3).filter((country) => countrySlug(country))
+  const languages = cleanList(parsed?.languages, 3)
+  // Search phrases must be plain words; drop anything that looks like a slug or
+  // a URL so a confused model cannot steer the app somewhere unexpected.
+  const search = cleanList(parsed?.search, 4).filter(
+    (phrase) => !/https?:|www\.|\/|\.html?$/i.test(phrase),
+  )
+  const person =
+    typeof parsed?.person === 'string' && parsed.person.trim().length > 2
+      ? parsed.person.replace(/\s+/g, ' ').trim().slice(0, 60)
+      : null
+
+  return {
+    search,
+    genres,
+    countries,
+    languages,
+    person,
+    yearFrom: cleanYear(parsed?.yearFrom),
+    yearTo: cleanYear(parsed?.yearTo),
+    wantsSeries: Boolean(parsed?.wantsSeries),
+    mood: typeof parsed?.mood === 'string' ? parsed.mood.trim().slice(0, 60) : '',
+    reply: typeof parsed?.reply === 'string' ? parsed.reply.trim().slice(0, 320) : '',
+    replyBn: typeof parsed?.replyBn === 'string' ? parsed.replyBn.trim().slice(0, 400) : '',
+  }
+}
+
+// Identical requests are common on a TV (the viewer re-asks, or the remote
+// double-fires). Serving them from memory costs zero quota.
+const intentCache = new Map()
+const INTENT_TTL = 30 * 60 * 1000
+
+function intentCacheKey(message, { prefs, targetName, topic, history }) {
+  const lastTurn = Array.isArray(history) && history.length
+    ? String(history[history.length - 1]?.text || '').slice(0, 120)
+    : ''
+  return [
+    String(message || '').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 160),
+    targetName || '',
+    prefs?.voiceLang || 'en',
+    prefs?.familyOnly ? 'family' : '',
+    prefs?.preferHindi ? 'hindi' : '',
+    String(topic || '').slice(0, 80),
+    lastTurn,
+  ].join('|')
+}
+
+async function interpretRequest({ message, memory = {}, prefs = {}, targetName = null, history = [], topic = '' }) {
+  const key = intentCacheKey(message, { prefs, targetName, topic, history })
+  const hit = intentCache.get(key)
+  if (hit && Date.now() - hit.at < INTENT_TTL) {
+    return { ...hit.data, cached: true }
+  }
+
+  const prompt = buildIntentPrompt({ message, memory, prefs, targetName, history, topic })
+  const answer = await callModel(prompt)
+  const parsed = parseJsonLoose(answer.content)
+  const intent = normalizeIntent(parsed)
+
+  const data = {
+    intent,
+    provider: answer.provider,
+    model: answer.model,
+  }
+  intentCache.set(key, { at: Date.now(), data })
+  if (intentCache.size > 400) {
+    // Drop the oldest quarter so the map cannot grow forever.
+    const sorted = [...intentCache.entries()].sort((a, b) => a[1].at - b[1].at)
+    for (const [oldKey] of sorted.slice(0, 100)) intentCache.delete(oldKey)
+  }
+  return data
+}
+
+/** Fold the AI's reading of the request into the text the catalog searches. */
+function mergeIntentText(text, intent) {
+  if (!intent) return String(text || '')
+  const parts = [String(text || '')]
+  // Deliberately no person names here: actor lookups must come from the
+  // viewer's own words, otherwise a hallucinated name can hijack the answer.
+  for (const phrase of intent.search || []) parts.push(phrase)
+  for (const genre of intent.genres || []) parts.push(genre.replace(/-/g, ' '))
+  for (const country of intent.countries || []) parts.push(country)
+  for (const language of intent.languages || []) parts.push(language)
+  return parts.join(' ').replace(/\s+/g, ' ').trim()
+}
+
+
 /* ───────────────────────── local fallback ───────────────────────── */
 
-function localRecommend(message, candidates, memory, prefs, { aiAttempted = false, targetName = null } = {}) {
+function localRecommend(
+  message,
+  candidates,
+  memory,
+  prefs,
+  { aiAttempted = false, targetName = null, intent = null } = {},
+) {
   const likedGenres = new Map(
     Object.entries(memory?.taste?.genres || {}).sort((a, b) => b[1] - a[1]).slice(0, 6),
   )
   const lowered = String(message || '').toLowerCase()
   const familyWords = /family|kids|children|cartoon|animated|family-friendly/.test(lowered)
   const wantsNew = /new|not watched|unwatched|haven'?t|already watched|exclude/.test(lowered)
-  const wantsHindi = /hindi|dubbed/.test(lowered)
-  const wantsKorean = /korean|korea|kdrama|k-drama/.test(lowered)
+  const wantsHindi = /hindi|dubbed/.test(lowered) || Boolean(intent?.languages?.some((l) => /hindi/i.test(l)))
+  const wantsKorean =
+    /korean|korea|kdrama|k-drama/.test(lowered) ||
+    Boolean(intent?.countries?.some((c) => /korea/i.test(c)))
   const wantsThriller = /thriller|suspense/.test(lowered)
-  const wantsSeries = /series|tv show|episodes|season|web series/.test(lowered)
+  const wantsSeries = intent?.wantsSeries || /series|tv show|episodes|season|web series/.test(lowered)
   const watchedSlugs = new Set((memory?.watched || []).map((x) => x.slug))
+
+  // Signals from the AI's reading of the request. They only re-order verified
+  // candidates; they never add a title the catalog does not contain.
+  const intentGenreRes = (intent?.genres || []).map((genre) => GENRE_PATTERNS[genre]).filter(Boolean)
+  const intentCountries = (intent?.countries || []).map(countrySlug).filter(Boolean)
+  const intentLanguages = (intent?.languages || []).map((lang) => lang.toLowerCase())
 
   const scored = candidates
     .filter((c) => !(wantsNew && watchedSlugs.has(c.slug)))
@@ -902,6 +1247,18 @@ function localRecommend(message, candidates, memory, prefs, { aiAttempted = fals
       if (wantsSeries && /tv-show|tv-series|series/i.test(c.via)) score += 10
       if (wantsHindi && (c.hindi || /hindi/i.test(c.title))) score += 2
       if (/search:/i.test(c.via)) score += 6
+      if (intentGenreRes.length && (c.genres || []).some((g) => intentGenreRes.some((re) => re.test(g)))) {
+        score += 9
+      }
+      if (intentCountries.length && intentCountries.some((slug) => inCountry(c.country, slug))) score += 9
+      if (
+        intentLanguages.length &&
+        intentLanguages.some((lang) =>
+          `${c.audio || ''} ${(c.genres || []).join(' ')}`.toLowerCase().includes(lang),
+        )
+      ) {
+        score += 5
+      }
       // Real quality dominates: a 7.8 title beats a 4.9 one by a wide margin.
       score += (typeof c.imdb === 'number' ? c.imdb : 6) * 4
       return { ...c, score }
@@ -918,9 +1275,15 @@ function localRecommend(message, candidates, memory, prefs, { aiAttempted = fals
         : `Verified in the CircleFTP catalog${c.audio ? ` · ${c.audio}` : ''}.`,
   }))
 
-  const wanted = [wantsKorean ? 'Korean titles' : null, wantsThriller ? 'thriller' : null, wantsHindi ? 'Hindi audio' : null]
+  const wanted = [
+    wantsKorean ? 'Korean titles' : null,
+    wantsThriller ? 'thriller' : null,
+    wantsHindi ? 'Hindi audio' : null,
+    intent?.mood || null,
+  ]
     .filter(Boolean)
-    .join(' · ')
+    .slice(0, 4)
+    .join(' · ') || ''
 
   return {
     reply: `${
@@ -1007,6 +1370,50 @@ function polishLocalPicks(picks, message) {
     )
 }
 
+/**
+ * A weak pick is a wasted slot, but never cut the list below something useful.
+ * Only drop titles rated under `min` when that still leaves `enough` picks.
+ */
+function applyQualityFloor(picks, { min = 6.0, enough = 10 } = {}) {
+  if (picks.length <= 4) return picks
+  const solid = picks.filter((pick) => pick.imdbRating == null || pick.imdbRating >= min)
+  if (solid.length >= enough) return solid.slice(0, 12)
+  return picks.slice(0, 12)
+}
+
+function summarizePicks(picks) {
+  const rated = picks.filter((pick) => typeof pick.imdbRating === 'number')
+  const avgRating = rated.length
+    ? Math.round((rated.reduce((sum, pick) => sum + pick.imdbRating, 0) / rated.length) * 10) / 10
+    : null
+  return { avgRating, ratedCount: rated.length }
+}
+
+/** The AI's acknowledgement + the real titles the app actually matched. */
+function composeIntentReply({ intent, picks, targetName }) {
+  const head = String(intent?.reply || '').trim()
+  const who = targetName === 'Everyone' ? ' for everyone' : targetName ? ` for ${targetName}` : ''
+  const fallback = `Here ${
+    picks.length === 1 ? 'is 1 verified catalog pick' : `are ${picks.length} verified catalog picks`
+  }${who}${intent?.mood ? ` for a ${intent.mood} night` : ''}.`
+  const names = picks.slice(0, 3).map((pick) => pick.title).filter(Boolean)
+  if (!names.length) return head || "I couldn't find anything matching that in the catalog."
+  // Only skip the list when the model already named at least two of the picks;
+  // a short title like "Aamir" would otherwise match "Aamir Khan" by accident.
+  const namedCount = names.filter((name) => head.toLowerCase().includes(name.toLowerCase())).length
+  if (namedCount >= Math.min(2, names.length)) return head || fallback
+  return `${head || fallback} Top matches: ${names.join(', ')}.`
+}
+
+function buildFollowups(intent, personName) {
+  if (personName) return [`Best of ${personName}`, 'Something different', 'A family pick']
+  return [
+    intent?.mood ? `More like ${intent.mood}` : 'Something with higher ratings',
+    'Something different',
+    'A family pick',
+  ]
+}
+
 export async function recommend({
   message,
   memory = {},
@@ -1023,8 +1430,47 @@ export async function recommend({
   const avoid = new Set((Array.isArray(avoidSlugs) ? avoidSlugs : []).map((s) => String(s)))
   // When the viewer is reacting to previous picks ("no brother, not these"),
   // gather candidates for the original topic, not for the complaint itself.
-  const gatheringText = topic ? `${topic} ${text}` : text
-  const gathered = await gatherCandidates(gatheringText, { referenceSlug })
+  const baseText = topic ? `${topic} ${text}` : text
+
+  const usableProviders = providerChain().filter((provider) => !isCoolingDown(provider.id))
+  const mode = AI_MODE()
+  const aiAvailable = usableProviders.length > 0 && mode !== 'off'
+
+  // ── intent pass ──────────────────────────────────────────────────────────
+  // A cheap AI call that sends no candidate list. It only reads the request and
+  // writes a short acknowledgement; the catalog search below does the finding.
+  // That keeps a free quota usable for far longer, and a dead provider costs a
+  // few seconds instead of the whole answer.
+  let intentCall = null
+  let intentError = ''
+  // The actor lookup and the AI intent read run in parallel: the person must
+  // come from the viewer's own words, never from the model.
+  const [intentResult, person] = await Promise.all([
+    aiAvailable && mode === 'intent'
+      ? interpretRequest({
+          message: text,
+          memory,
+          prefs,
+          targetName,
+          history,
+          topic,
+        }).catch((err) => {
+          intentError = String(err?.message || err)
+          console.log(`[ai] intent unavailable: ${intentError.slice(0, 160)}`)
+          return null
+        })
+      : Promise.resolve(null),
+    resolvePersonInQuery(baseText).catch(() => null),
+  ])
+  intentCall = intentResult
+  const intent = intentCall?.intent || null
+  const gatheringText = intent ? mergeIntentText(baseText, intent) : baseText
+  const gathered = await gatherCandidates(gatheringText, {
+    referenceSlug,
+    intent,
+    person,
+    explicit: matchSegments(baseText),
+  })
   const candidates = avoid.size
     ? gathered.candidates.filter((c) => !avoid.has(c.slug))
     : gathered.candidates
@@ -1048,32 +1494,63 @@ export async function recommend({
   // ── request coverage ─────────────────────────────────────────────────────
   // The catalog is movie-heavy and has no real TV-series section, so the model
   // must know that up front instead of pretending or swapping in random titles.
-  const wantsSeries = /\b(web[\s-]?series|tv[\s-]?series|tv[\s-]?show|series|seasons?|episodes?)\b/i.test(
-    text,
-  )
+  const wantsSeries =
+    Boolean(intent?.wantsSeries) ||
+    /\b(web[\s-]?series|tv[\s-]?series|tv[\s-]?show|series|seasons?|episodes?)\b/i.test(text)
   const seriesCount = candidates.filter((c) => c.series).length
   const coverage = { wantsSeries, seriesCount }
   const focusCountries = matchSegments(gatheringText).filter(
     (segment) => !segment.filler && segment.type === 'country',
   )
 
-  const usableProviders = providerChain().filter((provider) => !isCoolingDown(provider.id))
   const coolingDown = aiConfigured() && usableProviders.length === 0
-  if (!aiConfigured() || !usableProviders.length) {
+  if (!aiAvailable) {
     const local = localRecommend(text, candidates, memory, prefs, {
       aiAttempted: coolingDown,
       targetName,
+      intent,
     })
     const picks = await hydratePicks(local.picks, candidateMap)
     return {
       ...local,
-      picks: polishLocalPicks(picks, text),
+      picks: applyQualityFloor(polishLocalPicks(picks, gatheringText)),
       source: 'local',
       candidates: candidates.length,
       aiCooldown: coolingDown,
     }
   }
 
+  // ── intent mode (default) ────────────────────────────────────────────────
+  // The AI read the request; the app searched the catalog and ranked the real
+  // titles. The AI never saw a candidate list and never returned a title, so
+  // nothing on screen can be invented.
+  if (mode === 'intent' && intent) {
+    const local = localRecommend(text, candidates, memory, prefs, { targetName, intent })
+    const picks = await hydratePicks(local.picks, candidateMap)
+    const polished = applyQualityFloor(polishLocalPicks(picks, gatheringText))
+    const reply = composeIntentReply({ intent, picks: polished, targetName })
+    const replyBn =
+      intent.replyBn ||
+      (prefs?.voiceLang === 'bn'
+        ? `আমি আপনার জন্য ক্যাটালগ থেকে ${polished.length}টি সিনেমা বেছে নিয়েছি। নিচে দেখে নিন।`
+        : '')
+
+    return {
+      reply,
+      replyBn: replyBn || undefined,
+      picks: polished,
+      followups: buildFollowups(intent, gathered.person?.name),
+      source: 'ai',
+      mode: 'intent',
+      model: intentCall.model,
+      provider: intentCall.provider,
+      targetName: targetName || undefined,
+      candidates: candidates.length,
+      ...summarizePicks(polished),
+    }
+  }
+
+  // ── full mode: the AI chooses from the verified candidate list ───────────
   const prompt = buildPrompt({
     message: text,
     candidates,
@@ -1245,5 +1722,8 @@ export const aiMeta = () => {
     coolingDown: chain
       .filter((provider) => isCoolingDown(provider.id))
       .map((provider) => provider.id),
+    // "intent" = the AI reads the request and the app searches; "full" = the
+    // AI chooses from the whole candidate list (more tokens).
+    mode: AI_MODE(),
   }
 }
