@@ -35,6 +35,7 @@ const DEFAULT_PREFS: Prefs = {
   tts: true,
   voiceLang: 'en',
   voiceGender: 'female',
+  listenLang: 'en',
 }
 const EMPTY_TASTE: Taste = { genres: {}, countries: {} }
 
@@ -331,6 +332,7 @@ export function MemoryProvider({ children }: { children: ReactNode }) {
       tts: list.some((p) => p.tts),
       voiceLang: list[0]?.voiceLang ?? DEFAULT_PREFS.voiceLang,
       voiceGender: list[0]?.voiceGender ?? DEFAULT_PREFS.voiceGender,
+      listenLang: list[0]?.listenLang ?? DEFAULT_PREFS.listenLang,
     }
   }, [profiles, prefsAll])
 
@@ -578,6 +580,7 @@ export function MemoryProvider({ children }: { children: ReactNode }) {
               tts: prefList.some((p) => p.tts),
               voiceLang: prefList[0]?.voiceLang ?? DEFAULT_PREFS.voiceLang,
               voiceGender: prefList[0]?.voiceGender ?? DEFAULT_PREFS.voiceGender,
+              listenLang: prefList[0]?.listenLang ?? DEFAULT_PREFS.listenLang,
             }
           : DEFAULT_PREFS
 

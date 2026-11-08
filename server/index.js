@@ -1,9 +1,17 @@
 import 'dotenv/config'
+import dns from 'node:dns'
 import os from 'node:os'
 import app from './app.js'
 import { indexStats, startCrawl, startWarmup } from './catalog.js'
 import { aiMeta } from './ai.js'
 import { transcodeAvailable } from './player.js'
+
+// Some home routers advertise broken IPv6; prefer IPv4 for Gemini/TMDB calls.
+try {
+  dns.setDefaultResultOrder('ipv4first')
+} catch {
+  /* older Node: ignore */
+}
 
 const PORT = Number(process.env.PORT) || 8787
 

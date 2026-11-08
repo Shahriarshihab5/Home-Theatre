@@ -2,9 +2,9 @@ import { useEffect, useState } from 'react'
 import { aiProviderLabel, api, imgSrc, prettyTitle, streamMode } from '../lib/api'
 import { useMemory } from '../lib/memory'
 import { focusFirst } from '../lib/nav'
-import { availableVoices, primeVoices, speak } from '../lib/speech'
+import { primeVoices, speak } from '../lib/speech'
 import { getSfxEnabled, setSfxEnabled, subscribeSfx } from '../lib/sfx'
-import type { HealthInfo, VoiceGender, VoiceLang } from '../types'
+import type { HealthInfo, ListenLang, VoiceGender, VoiceLang } from '../types'
 import { BookmarkIcon, CheckIcon, DownloadIcon, HeartIcon, SpeakerIcon, ThumbDownIcon, TrashIcon, XIcon } from './icons'
 
 interface SettingsPanelProps {
@@ -171,13 +171,14 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
         <section className="mb-5 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
           <h3 className="mb-1 flex items-center justify-between text-sm font-bold uppercase tracking-widest text-white/40">
             <span>Assistant voice</span>
-            <span className="text-[0.6rem] normal-case tracking-normal text-white/25">spoken only</span>
+            <span className="text-[0.6rem] normal-case tracking-normal text-white/25">voice + reply</span>
           </h3>
           <p className="mb-3 text-xs leading-relaxed text-white/40">
-            The AI can talk in English or Bengali. On-screen text stays English; this only changes what you hear.
+            The AI can talk and write in English or Bengali. Choosing বাংলা also shows the reply in Bengali and
+            speaks it with a female Bengali voice.
           </p>
 
-          <p className="mb-1.5 text-[0.65rem] font-bold uppercase tracking-widest text-white/30">Language</p>
+          <p className="mb-1.5 text-[0.65rem] font-bold uppercase tracking-widest text-white/30">Assistant speaks</p>
           <div className="flex flex-wrap gap-2">
             {(
               [
@@ -197,6 +198,30 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
               </button>
             ))}
           </div>
+
+          <p className="mb-1.5 mt-3 text-[0.65rem] font-bold uppercase tracking-widest text-white/30">You speak</p>
+          <div className="flex flex-wrap gap-2">
+            {(
+              [
+                ['en', 'English'],
+                ['bn', 'বাংলা Bangla'],
+              ] as [ListenLang, string][]
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                data-nav
+                onClick={() => memory.setPrefs({ listenLang: id })}
+                className={`chip !text-sm ${memory.prefs.listenLang === id ? '!border-gold !bg-gold/15 !text-gold' : ''}`}
+              >
+                {memory.prefs.listenLang === id ? <CheckIcon width={14} height={14} /> : null}
+                {label}
+              </button>
+            ))}
+          </div>
+          <p className="mt-1.5 text-[0.65rem] leading-relaxed text-white/30">
+            The microphone understands this language, so your own words are written in the same script.
+          </p>
 
           <p className="mb-1.5 mt-3 text-[0.65rem] font-bold uppercase tracking-widest text-white/30">Voice</p>
           <div className="flex flex-wrap gap-2">
@@ -238,8 +263,8 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
 
           <p className="mt-2 text-[0.65rem] leading-relaxed text-white/30">
             {memory.prefs.voiceLang === 'bn'
-              ? `${availableVoices('bn').length} Bengali voice${availableVoices('bn').length === 1 ? '' : 's'} found on this device. If it sounds wrong, install Bengali text-to-speech on the TV (Android TV: Settings → System → Languages → Text-to-speech).`
-              : 'For Bengali speech, the TV needs a Bengali text-to-speech voice installed (Android TV: Settings → System → Languages → Text-to-speech).'}
+              ? 'Bengali replies are spoken by the app’s own female voice, so they work even when the TV has no Bengali text-to-speech installed.'
+              : 'Pick বাংলা Bangla above to hear the assistant speak Bengali. It works without installing anything on the TV.'}
           </p>
         </section>
 
@@ -353,9 +378,17 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
             </div>
             <div className="flex justify-between gap-4">
               <dt className="text-white/40">Open on TV</dt>
-              <dd className="text-right font-mono text-xs text-gold/90">{window.location.origin}</dd>
+              <dd className="text-right font-mono text-xs text-gold/90">
+                {health?.lan?.url || window.location.origin}
+              </dd>
             </div>
           </dl>
+          {health?.lan?.url ? (
+            <p className="mt-3 rounded-xl bg-white/[0.04] p-3 text-xs leading-relaxed text-white/45 ring-1 ring-white/10">
+              Type that address into the TV browser once and bookmark it. The server now starts automatically
+              when this laptop signs in, so the TV link keeps working as long as the laptop is on.
+            </p>
+          ) : null}
           {streamMode === 'external' ? (
             <p className="mt-3 rounded-xl bg-amber-400/10 p-3 text-xs leading-relaxed text-amber-200/80 ring-1 ring-amber-300/20">
               This page is served over HTTPS. CircleFTP only supports HTTP, so in-app playback is blocked by the

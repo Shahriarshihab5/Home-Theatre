@@ -131,6 +131,32 @@ export function normalizeTitle(raw) {
     .trim()
 }
 
+/**
+ * Aggressive comparison key for titles: case, accents, punctuation, a leading
+ * article and "&" are ignored. "The Dark Knight" === "dark knight".
+ */
+export function titleKey(raw) {
+  return String(raw || '')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/^(?:the|a|an)\s+/, '')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/** True when the learned index already has a title with exactly this name. */
+export function hasCatalogTitle(title) {
+  const key = titleKey(title)
+  if (!key) return false
+  for (const entry of qualityIndex.values()) {
+    if (titleKey(entry.title) === key) return true
+  }
+  return false
+}
+
 export function slugFromLink(href) {
   const m = String(href || '').match(/\/watch\/([a-z0-9-]+)\.html/i)
   return m ? m[1] : ''
@@ -404,18 +430,36 @@ export async function getListing(type, slug, offset = 0) {
   })
 }
 
+/** Strip filler words from spoken/typed queries: "dangal movie" -> "dangal". */
+export function cleanSearchQuery(raw) {
+  let q = String(raw || '')
+    .normalize('NFKC')
+    .replace(/[“”"']/g, ' ')
+    .trim()
+  q = q.replace(/^(?:please\s+|show me\s+|i want to (?:watch|see)\s+|find\s+|search(?: for)?\s+)/i, '')
+  q = q.replace(/\b(?:movies?|films?|pictures?|videos?)\b/gi, ' ')
+  return q.replace(/\s+/g, ' ').trim()
+}
+
 export async function searchCatalog(query) {
-  const q = String(query || '').trim()
-  if (!q) return { query: '', items: [] }
+  const original = String(query || '').trim()
+  const q = cleanSearchQuery(original)
+  if (!q) return { query: original, items: [] }
   if (OFFLINE_MODE) return snapshotSearch(q)
 
   return cached(`search:${q.toLowerCase()}`, SEARCH_TTL, async () => {
     try {
       const html = await fetchPage(`/search.html?q=${encodeURIComponent(q)}`)
-      return { query: q, items: parseList(html) }
+      const live = parseList(html)
+      if (live.length) return { query: original, items: live }
+
+      // CircleFTP's search is title-only. Fall back to the saved snapshot so
+      // "korean thriller" / "hindi comedy" still return real catalog titles.
+      const saved = snapshotSearch(q)
+      return { ...saved, query: original, fallback: true }
     } catch (err) {
       const saved = snapshotSearch(q)
-      if (saved.items.length) return { ...saved, fallback: true }
+      if (saved.items.length) return { ...saved, query: original, fallback: true }
       throw err
     }
   })
@@ -737,7 +781,17 @@ let warmupPromise = null
 export function startWarmup() {
   if (OFFLINE_MODE) return Promise.resolve(0)
   if (warmupPromise) return warmupPromise
+  // The persistent index already holds thousands of titles across restarts.
+  // Re-scanning them at every boot saturated CircleFTP and made the first
+  // searches feel slow, so only warm a genuinely empty index.
+  if (qualityIndex.size >= 400) {
+    console.log(`[warmup] skipped — ${qualityIndex.size} titles already indexed`)
+    return Promise.resolve(0)
+  }
   warmupPromise = (async () => {
+  // Give the TV a moment to load and make its first request before we start
+  // background traffic.
+  await new Promise((resolve) => setTimeout(resolve, 8000))
   const seeds = []
   const jobs = [
     ['genre', 'action'],
@@ -947,6 +1001,147 @@ function snapshotCard(entry) {
   }
 }
 
+const GENRE_CANON = {
+  sifi: 'scifi',
+  scifi: 'scifi',
+  sciencefiction: 'scifi',
+  romantic: 'romance',
+  sports: 'sport',
+  sporting: 'sport',
+  comedic: 'comedy',
+  dramatic: 'drama',
+  scary: 'horror',
+  animated: 'animation',
+  biographical: 'biography',
+  historical: 'history',
+  gangster: 'crime',
+  mafia: 'crime',
+  kids: 'family',
+  children: 'family',
+}
+
+function canonGenre(value) {
+  const key = String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '')
+  return GENRE_CANON[key] || key
+}
+
+function canonCountry(value) {
+  const key = String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '')
+  if (/^(usa|us|unitedstates|america|american|hollywood)$/.test(key)) return 'usa'
+  if (/^(uk|unitedkingdom|britain|british|england|english)$/.test(key)) return 'uk'
+  if (/korea/.test(key)) return 'korea'
+  if (/india|indian|bollywood/.test(key)) return 'india'
+  if (/japan/.test(key)) return 'japan'
+  if (/china/.test(key)) return 'china'
+  if (/thai/.test(key)) return 'thailand'
+  if (/turk/.test(key)) return 'turkey'
+  if (/france|french/.test(key)) return 'france'
+  if (/spain|spanish/.test(key)) return 'spain'
+  if (/german|germany/.test(key)) return 'germany'
+  if (/russia/.test(key)) return 'russia'
+  if (/indonesia/.test(key)) return 'indonesia'
+  return key
+}
+
+/**
+ * Lightweight genre/country hints from a natural-language query. Used by the
+ * search page so "amir khan sports movies" narrows to the Sport titles.
+ */
+const FILTER_GENRES = [
+  ['action', /\b(action|fight|explosion|explosive)\b/i],
+  ['comedy', /\b(comedy|comedies|funny|laugh|humou?r)\b/i],
+  ['thriller', /\b(thriller|suspense|tense)\b/i],
+  ['horror', /\b(horror|scary|ghost)\b/i],
+  ['romance', /\b(romance|romantic|love)\b/i],
+  ['drama', /\b(drama|dramatic|emotional)\b/i],
+  ['family', /\b(family|kids|children)\b/i],
+  ['animation', /\b(animation|animated|cartoon|anime)\b/i],
+  ['crime', /\b(crime|gangster|mafia)\b/i],
+  ['mystery', /\b(mystery|detective)\b/i],
+  ['sci-fi', /\b(sci[\s-]?fi|science fiction|space)\b/i],
+  ['fantasy', /\b(fantasy|magic)\b/i],
+  ['adventure', /\b(adventure|quest)\b/i],
+  ['biography', /\b(biograph\w*|true story)\b/i],
+  ['sport', /\b(sports?|sporting)\b/i],
+  ['history', /\b(history|historical)\b/i],
+  ['war', /\b(war|army|military)\b/i],
+]
+
+const FILTER_COUNTRIES = [
+  ['india', /\b(indian|india|bollywood)\b/i],
+  ['usa', /\b(american|usa|hollywood)\b/i],
+  ['korea', /\b(korean|korea|kdrama)\b/i],
+  ['japan', /\b(japanese|japan)\b/i],
+  ['china', /\b(chinese|china)\b/i],
+  ['thailand', /\b(thai|thailand)\b/i],
+  ['turkey', /\b(turkish|turkey)\b/i],
+  ['uk', /\b(british|uk)\b/i],
+  ['france', /\b(french|france)\b/i],
+  ['spain', /\b(spanish|spain)\b/i],
+  ['germany', /\b(german|germany)\b/i],
+  ['russia', /\b(russian|russia)\b/i],
+  ['indonesia', /\b(indonesian|indonesia)\b/i],
+]
+
+export function detectQueryFilters(query) {
+  const text = String(query || '')
+  return {
+    genres: FILTER_GENRES.filter(([, pattern]) => pattern.test(text)).map(([name]) => name),
+    countries: FILTER_COUNTRIES.filter(([, pattern]) => pattern.test(text)).map(([name]) => name),
+    languages: /\b(hindi|bangla|bengali|tamil|telugu)\b/i.test(text)
+      ? [String(text.match(/\b(hindi|bangla|bengali|tamil|telugu)\b/i)[1]).toLowerCase()]
+      : [],
+  }
+}
+
+/**
+ * Match an external filmography to titles actually present in the catalog.
+ * Wikidata supplies only the person→film relationship; availability always
+ * comes from the verified index. Year proximity rejects same-name remakes.
+ */
+export function matchPersonFilms(films, { genres = [], countries = [], limit = 60 } = {}) {
+  const list = Array.isArray(films) ? films : []
+  if (!list.length) return []
+
+  const filmYears = new Map()
+  for (const film of list) {
+    const key = titleKey(film?.title)
+    if (!key) continue
+    if (!filmYears.has(key)) filmYears.set(key, new Set())
+    if (Number(film.year)) filmYears.get(key).add(Number(film.year))
+  }
+  if (!filmYears.size) return []
+
+  const wantedGenres = new Set(genres.map(canonGenre).filter(Boolean))
+  const wantedCountries = new Set(countries.map(canonCountry).filter(Boolean))
+
+  const matches = []
+  for (const entry of qualityIndex.values()) {
+    const key = titleKey(entry.title)
+    const years = filmYears.get(key)
+    if (!years) continue
+
+    if (entry.year && years.size && ![...years].some((year) => Math.abs(year - entry.year) <= 1)) {
+      continue
+    }
+    if (wantedGenres.size) {
+      const entryGenres = (entry.genres || []).map(canonGenre)
+      if (!entryGenres.some((genre) => wantedGenres.has(genre))) continue
+    }
+    if (wantedCountries.size) {
+      if (!wantedCountries.has(canonCountry(entry.country))) continue
+    }
+    matches.push(entry)
+  }
+
+  matches.sort(byRating)
+  return matches.slice(0, limit).map(snapshotCard)
+}
+
 const LISTING_COUNTRY = {
   india: /india/i,
   usa: /usa|united states/i,
@@ -1010,19 +1205,59 @@ function snapshotListing(type, slug, offset = 0) {
 }
 
 function snapshotSearch(query) {
-  const needle = String(query || '').toLowerCase().trim()
+  const needle = cleanSearchQuery(query).toLowerCase()
   if (!needle) return { query: '', items: [], snapshot: true }
   const words = needle.split(/\s+/).filter(Boolean)
+  const stem = (word) => word.replace(/s$/, '')
+  const filters = detectQueryFilters(needle)
+  const hasFilters = filters.genres.length > 0 || filters.countries.length > 0 || filters.languages.length > 0
+
+  const languageMatches = (entry, language) => {
+    const audio = String(entry.audio || '').toLowerCase()
+    if (language === 'hindi') return Boolean(entry.hindi) || audio.includes('hindi')
+    if (language === 'bangla' || language === 'bengali') return audio.includes('bengali') || audio.includes('bangla')
+    return audio.includes(language)
+  }
+
   const scored = []
   for (const entry of snapshotEntries()) {
+    if (hasFilters) {
+      if (
+        filters.genres.length &&
+        !(entry.genres || []).some((genre) =>
+          filters.genres.some((wanted) => canonGenre(genre) === canonGenre(wanted)),
+        )
+      ) {
+        continue
+      }
+      if (
+        filters.countries.length &&
+        !filters.countries.some((wanted) => canonCountry(entry.country) === canonCountry(wanted))
+      ) {
+        continue
+      }
+      if (filters.languages.length && !filters.languages.every((language) => languageMatches(entry, language))) {
+        continue
+      }
+    }
+
     const title = String(entry.title || '').toLowerCase()
     const meta = `${(entry.genres || []).join(' ')} ${entry.country || ''}`.toLowerCase()
+    const haystack = `${title} ${meta}`
     let score = 0
     if (title === needle) score = 120
     else if (title.startsWith(needle)) score = 90
     else if (title.includes(needle)) score = 70
-    else if (words.length > 1 && words.every((word) => title.includes(word))) score = 50
-    else if (meta.includes(needle)) score = 25
+    else if (words.length > 1) {
+      const hits = words.filter((word) => haystack.includes(word) || haystack.includes(stem(word))).length
+      if (hits === words.length) score = 55
+      else if (hits >= Math.ceil(words.length * 0.6)) score = 30
+      else if (hits > 0) score = 12
+    } else if (haystack.includes(stem(needle))) score = 25
+
+    // A genre/country/language filter is itself a valid match: the viewer asked
+    // "korean thriller" even though no title contains those words.
+    if (hasFilters) score = Math.max(score, 40)
     if (!score) continue
     scored.push({ entry, score })
   }

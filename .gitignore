@@ -8,6 +8,10 @@ test.mp4
 
 # Live learned index (rebuilt on the home network; the cloud uses the snapshot)
 /data/
+server/data/people-cache.json
 
 # Scratch space for the poster builder
 public/posters/_tmp/
+
+.vercel
+.env*

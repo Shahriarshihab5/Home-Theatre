@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { HashRouter, Outlet, Route, Routes, useLocation } from 'react-router-dom'
+import { useEffect, useRef, useState } from 'react'
+import { HashRouter, Outlet, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { NavBar } from './components/NavBar'
 import { ProfilesPanel } from './components/ProfilesPanel'
@@ -10,6 +10,7 @@ import { installSfx } from './lib/sfx'
 import { HindiPage } from './pages/Hindi'
 import { HistoryPage } from './pages/History'
 import { HomePage } from './pages/Home'
+import { SearchPage } from './pages/Search'
 import { WatchPage } from './pages/Watch'
 import { WatchlistPage } from './pages/Watchlist'
 
@@ -21,6 +22,29 @@ function RemoteNavigation() {
     if (location.pathname.startsWith('/watch')) return
     return installSpatialNav()
   }, [location.pathname])
+
+  return null
+}
+
+/** Keeps the TV Back button inside the app instead of leaving for the last
+ *  CircleFTP page. Modals close first; then any page returns to Home. */
+function HistoryGuard() {
+  const location = useLocation()
+  const navigate = useNavigate()
+  const pathRef = useRef(location.pathname)
+  pathRef.current = location.pathname
+
+  useEffect(() => {
+    const state = { homeTheatre: true }
+    window.history.pushState(state, '')
+    const onPop = () => {
+      document.dispatchEvent(new CustomEvent('tv-back'))
+      if (pathRef.current !== '/') navigate('/', { replace: true })
+      window.history.pushState(state, '')
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [navigate])
 
   return null
 }
@@ -50,9 +74,11 @@ export default function App() {
       <MemoryProvider>
         <HashRouter>
           <RemoteNavigation />
+          <HistoryGuard />
           <Routes>
             <Route element={<AppLayout />}>
               <Route path="/" element={<HomePage />} />
+              <Route path="/search" element={<SearchPage />} />
               <Route path="/hindi" element={<HindiPage />} />
               <Route path="/history" element={<HistoryPage />} />
               <Route path="/watchlist" element={<WatchlistPage />} />

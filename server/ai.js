@@ -13,17 +13,33 @@
  *    so the app stays fully usable.
  */
 
-import { getDetail, getListing, indexEntry, indexedTitles, peekDetail, searchCatalog } from './catalog.js'
+import {
+  getDetail,
+  getListing,
+  indexEntry,
+  indexedTitles,
+  matchPersonFilms,
+  peekDetail,
+  searchCatalog,
+} from './catalog.js'
+import { resolvePersonInQuery } from './people.js'
 
 /* ─────────────────────────── provider config ─────────────────────────── */
 
 const GEMINI_KEY = () => process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || ''
-const GEMINI_MODEL = () => stripModelsPrefix(process.env.GEMINI_MODEL || 'gemini-3.5-flash')
+const GEMINI_MODEL = () => stripModelsPrefix(process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite')
 const GEMINI_FALLBACK_MODEL = () =>
-  stripModelsPrefix(process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash-lite')
+  stripModelsPrefix(process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash')
 const GEMINI_BASE = () =>
   (process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/$/, '')
-const GEMINI_THINKING = () => (process.env.GEMINI_THINKING_LEVEL ?? 'low').toLowerCase()
+// Blank = no thinkingConfig (fastest on flash-lite). A positive number allows
+// that many thinking tokens. 0 is rejected by the API, so it is treated as off.
+const GEMINI_THINKING_BUDGET = () => {
+  const raw = process.env.GEMINI_THINKING_BUDGET
+  if (!raw) return -1
+  const value = Number(raw)
+  return Number.isFinite(value) && value > 0 ? value : -1
+}
 
 const DEEPSEEK_KEY = () => process.env.DEEPSEEK_API_KEY || ''
 const DEEPSEEK_BASE = () => (process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com').replace(/\/$/, '')
@@ -32,6 +48,38 @@ const DEEPSEEK_THINKING = () => (process.env.DEEPSEEK_THINKING || 'disabled').to
 
 function stripModelsPrefix(model) {
   return String(model || '').replace(/^models\//, '')
+}
+
+/**
+ * Gemini occasionally stalls for 20+ seconds on a home connection. When that
+ * happens, skip the API for a short while so the TV answers immediately with
+ * the local ranker instead of making the viewer wait again.
+ */
+let aiCooldownUntil = 0
+const AI_COOLDOWN_MS = 60000
+
+function isTransientError(error) {
+  if (!error) return false
+  return (
+    [404, 429, 500, 502, 503, 504].includes(error.status) ||
+    /high demand|overload|abort|fetch failed|network|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|socket/i.test(
+      String(error.message || ''),
+    )
+  )
+}
+
+/** A network stall will not be fixed by swapping models; fail fast instead. */
+function isNetworkFailure(error) {
+  return /abort|fetch failed|network|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|socket/i.test(
+    String(error?.message || ''),
+  )
+}
+
+function openAiCooldown(error) {
+  aiCooldownUntil = Date.now() + AI_COOLDOWN_MS
+  console.log(
+    `[ai] circuit open for ${Math.round(AI_COOLDOWN_MS / 1000)}s after: ${String(error?.message || error).slice(0, 120)}`,
+  )
 }
 
 /** Which provider will actually be used on the next call. */
@@ -74,15 +122,21 @@ const KEYWORD_MAP = [
   { words: ['fantasy', 'magic'], type: 'genre', slug: 'fantasy' },
   { words: ['adventure', 'quest'], type: 'genre', slug: 'adventure' },
   { words: ['biography', 'true story'], type: 'genre', slug: 'biography' },
+  { words: ['sport', 'sports', 'sports movie'], type: 'genre', slug: 'sport' },
   { words: ['war', 'army', 'military'], type: 'genre', slug: 'war' },
   { words: ['series', 'tv show', 'tv-series', 'episodes'], type: 'genre', slug: 'tv-show' },
 ]
+
+function hasWord(text, word) {
+  const escaped = String(word).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, 'i').test(text)
+}
 
 function matchSegments(message) {
   const text = String(message || '').toLowerCase()
   const found = []
   for (const entry of KEYWORD_MAP) {
-    if (entry.words.some((w) => text.includes(w))) found.push(entry)
+    if (entry.words.some((w) => hasWord(text, w))) found.push(entry)
   }
   // Always add broad, high-quality rows so there are enough verified
   // candidates for a 10–15 title answer, even when the wording is vague.
@@ -223,8 +277,45 @@ function rankCandidates(candidates) {
 }
 
 async function gatherCandidates(message, { referenceSlug } = {}) {
-  const pages = []
   const segments = matchSegments(message)
+
+  // Actor lookups need a network round-trip; run them first and, when the
+  // person is known, answer only from their verified filmography. That is both
+  // correct (no padding) and much faster than scanning the whole catalog.
+  const person = await resolvePersonInQuery(message).catch(() => null)
+  if (person) {
+    const personGenres = segments
+      .filter((seg) => seg.type === 'genre' && !seg.filler)
+      .map((seg) => seg.slug)
+    const personCountries = segments.filter((seg) => seg.type === 'country').map((seg) => seg.slug)
+    const actorItems = matchPersonFilms(person.films, {
+      genres: personGenres,
+      countries: personCountries,
+      limit: 60,
+    })
+    if (!actorItems.length) return { candidates: [], person }
+
+    const list = actorItems.map((item) => {
+      const learned = indexEntry(item.slug)
+      return {
+        slug: item.slug,
+        title: item.title,
+        via: `actor: ${person.name}`,
+        thumb: item.thumb || learned?.thumb || '',
+        quality: item.quality || learned?.quality,
+        imdb: learned?.imdb ?? item.imdbRating ?? null,
+        genres: learned?.genres || item.genres || [],
+        country: learned?.country || item.country || '',
+        series: Boolean(learned?.series),
+        audio: learned?.audio || item.audioLabel || '',
+        hindi: Boolean(learned?.hindi),
+      }
+    })
+    await fillRatings(rankCandidates(list))
+    return { candidates: rankCandidates(list).slice(0, 90), person }
+  }
+
+  const pages = []
 
   // Free-text search often catches the exact title the user mentions.
   const words = String(message)
@@ -331,7 +422,7 @@ async function gatherCandidates(message, { referenceSlug } = {}) {
 
   const pool = [...merged.values()]
   await fillRatings(rankCandidates(pool))
-  return rankCandidates(pool).slice(0, 150)
+  return { candidates: rankCandidates(pool).slice(0, 90), person: null }
 }
 
 const STOPWORDS = new Set([
@@ -347,7 +438,16 @@ const STOPWORDS = new Set([
 
 /* ───────────────────────────── provider calls ───────────────────────────── */
 
-function buildPrompt({ message, candidates, memory, prefs, targetName, history = [], coverage = {} }) {
+function buildPrompt({
+  message,
+  candidates,
+  memory,
+  prefs,
+  targetName,
+  history = [],
+  coverage = {},
+  person = null,
+}) {
   const liked = (memory?.likes || []).slice(0, 25).map((x) => x.title)
   const disliked = (memory?.dislikes || []).slice(0, 15).map((x) => x.title)
   const watched = (memory?.watched || []).slice(0, 60).map((x) => x.title)
@@ -395,8 +495,8 @@ You recommend ONLY titles from the VERIFIED CATALOG below — titles that are co
 You must never invent titles, slugs, ratings or availability.
 
 RULES
-1. Return up to 15 titles exclusively from the VERIFIED CATALOG and aim for 10–15. Copy their slugs exactly. If the request is narrow (a specific country + format + audio) and fewer than 10 titles genuinely match, return only the ones that truly match (at least 5) and say the choice is small. NEVER pad the list with titles from another country, genre, audience or format just to reach ten.
-2. Explain each pick in 1-2 short sentences ("why"), referencing genre, mood, country, IMDb rating if known, or audio info. Be concrete, not salesy.
+1. Return up to 15 titles exclusively from the VERIFIED CATALOG and aim for 10-15. Copy their slugs exactly. If the request is narrow (a specific actor, country, format or audio) and fewer than 10 titles genuinely match, return only the ones that truly match — however few — and say the choice is small. NEVER pad the list with titles that do not satisfy the request just to reach ten.
+2. Explain each pick in ONE short sentence ("why", at most 18 words), referencing genre, mood, country, IMDb rating if known, or audio info. Be concrete, not salesy.
 3. QUALITY COMES FIRST. The catalog is huge, so never pad the list with weak titles:
    - Strongly prefer titles rated 7.0 or higher.
    - Only include a title rated below 6.0 if you have fewer than 10 candidates rated above it.
@@ -411,7 +511,7 @@ RULES
 10. THIS IS A CONVERSATION. When earlier turns exist, the latest message is usually feedback on your previous picks ("no brother I don't like it", "update a bit", "not this type"). Then: acknowledge it in one short sentence, change the selection meaningfully in the direction the feedback implies, and never repeat a title you already suggested. If the feedback is vague, vary the picks decisively instead of asking many questions.
 11. Output STRICT JSON only, matching:
 {"reply": string, "picks": [{"slug": string, "why": string}], "followups": [string, string, string]${wantsBanglaVoice ? ', "replyBn": string' : ''}}
-${wantsBanglaVoice ? '12. The viewer chose a Bengali speaking voice. Also write "replyBn": the same short introduction in natural Bengali (বাংলা script) for text-to-speech — 1 to 2 warm sentences, no transliteration, no English sentences, no markdown. Keep it faithful to "reply".' : ''}
+${wantsBanglaVoice ? '12. The viewer chose a Bengali speaking voice. Also write "replyBn": a warm, conversational Bengali (বাংলা script) version of the introduction for text-to-speech — 2 to 3 short sentences, as if talking to a friend, addressing the viewer by name. Never use transliteration, English sentences or markdown. If the viewer wrote in Bengali, answer in Bengali there.' : ''}
 
 USER MEMORY
 ${
@@ -450,6 +550,11 @@ ${
 
 CATALOG QUALITY NOTE
 ${ratedCount} of the ${candidates.length} candidates below have a verified IMDb rating.
+${
+  person
+    ? `\nACTOR MATCH: the viewer named ${person.name}. Every candidate marked "(found in actor: ${person.name})" is a verified credit and is present in this catalog — recommend ONLY those titles. Do not add any other title, even if it shares a genre, mood or country. If the viewer also named a genre or country, keep only the matching ones; if none match, say so honestly rather than inventing credits.`
+    : ''
+}
 
 VERIFIED CATALOG (slug :: title):
 ${candidateLines}`
@@ -462,14 +567,31 @@ ${candidateLines}`
 
 /* ── Gemini (free tier) ─────────────────────────────────────────────────── */
 
+async function fetchWithRetry(url, init, attempts = 2) {
+  let lastError
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await fetch(url, init)
+    } catch (err) {
+      lastError = err
+      if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, 450))
+    }
+  }
+  throw lastError
+}
+
 async function callGeminiOnce(model, system, user, { withThinking }) {
   const generationConfig = {
     temperature: 0.45,
-    maxOutputTokens: 3072,
+    maxOutputTokens: 2048,
     responseMimeType: 'application/json',
   }
-  const level = GEMINI_THINKING()
-  if (withThinking && level) generationConfig.thinkingConfig = { thinkingLevel: level }
+  if (withThinking) {
+    // Thinking tokens come out of maxOutputTokens and repeatedly truncated the
+    // JSON answer. Selecting from a fixed list does not need them.
+    const budget = GEMINI_THINKING_BUDGET()
+    if (budget > 0) generationConfig.thinkingConfig = { thinkingBudget: budget }
+  }
 
   const body = {
     systemInstruction: { parts: [{ text: system }] },
@@ -478,10 +600,11 @@ async function callGeminiOnce(model, system, user, { withThinking }) {
   }
 
   const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), 45000)
+  const timer = setTimeout(() => ctrl.abort(), 9000)
+  const startedAt = Date.now()
   let res
   try {
-    res = await fetch(`${GEMINI_BASE()}/models/${encodeURIComponent(model)}:generateContent`, {
+    res = await fetchWithRetry(`${GEMINI_BASE()}/models/${encodeURIComponent(model)}:generateContent`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -490,6 +613,9 @@ async function callGeminiOnce(model, system, user, { withThinking }) {
       body: JSON.stringify(body),
       signal: ctrl.signal,
     })
+  } catch (err) {
+    console.log(`[ai] ${model} network error after ${Date.now() - startedAt}ms: ${err.message}`)
+    throw err
   } finally {
     clearTimeout(timer)
   }
@@ -511,6 +637,10 @@ async function callGeminiOnce(model, system, user, { withThinking }) {
   const data = JSON.parse(text)
   const parts = data?.candidates?.[0]?.content?.parts || []
   const content = parts.map((p) => p?.text || '').join('').trim()
+  const usage = data?.usageMetadata || {}
+  console.log(
+    `[ai] ${model} ok in ${Date.now() - startedAt}ms (${content.length} chars, finish=${data?.candidates?.[0]?.finishReason}, out=${usage.candidatesTokenCount ?? '?'}, think=${usage.thoughtsTokenCount ?? 0})`,
+  )
   if (!content) {
     const blocked = data?.promptFeedback?.blockReason
     const finish = data?.candidates?.[0]?.finishReason
@@ -528,7 +658,7 @@ async function callGeminiModel(model, system, user) {
     return await callGeminiOnce(model, system, user, { withThinking: true })
   } catch (err) {
     // Some models reject thinkingConfig — retry once without it.
-    if (err.status === 400 && /thinking/i.test(err.message)) {
+    if (err.status === 400 && /thinking|invalid argument/i.test(err.message)) {
       return await callGeminiOnce(model, system, user, { withThinking: false })
     }
     throw err
@@ -539,22 +669,35 @@ async function callGemini(system, user) {
   const primary = GEMINI_MODEL()
 
   try {
-    return await callGeminiModel(primary, system, user)
+    const result = await callGeminiModel(primary, system, user)
+    aiCooldownUntil = 0
+    return result
   } catch (primaryError) {
-    // Free-tier models can be overloaded (503) or quota-limited (429). The Lite
-    // model has a separate, very reliable free quota — use it as a safety net.
+    // A timeout / DNS / socket failure is not model-specific. Swapping to the
+    // fallback would just wait another timeout, so stop immediately.
+    if (isNetworkFailure(primaryError)) {
+      openAiCooldown(primaryError)
+      throw primaryError
+    }
+
+    // Free-tier models can be overloaded (503) or quota-limited (429). The
+    // fallback model has a separate free quota — use it as a safety net.
     const fallback = GEMINI_FALLBACK_MODEL()
-    const retriable =
-      [404, 429, 503].includes(primaryError.status) || /high demand|overload/i.test(primaryError.message)
+    const retriable = isTransientError(primaryError)
+    console.log(`[ai] primary ${primary} failed: ${primaryError.message.slice(0, 140)} (fallback=${retriable})`)
 
     if (fallback && fallback !== primary && retriable) {
       try {
-        return await callGeminiModel(fallback, system, user)
+        const result = await callGeminiModel(fallback, system, user)
+        aiCooldownUntil = 0
+        return result
       } catch (fallbackError) {
+        if (isTransientError(fallbackError)) openAiCooldown(fallbackError)
         throw new Error(`${primaryError.message} → fallback ${fallbackError.message}`)
       }
     }
 
+    if (isTransientError(primaryError)) openAiCooldown(primaryError)
     throw primaryError
   }
 }
@@ -575,7 +718,7 @@ async function callDeepSeek(messages) {
   if (DEEPSEEK_THINKING() !== 'enabled') body.thinking = { type: 'disabled' }
 
   const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), 45000)
+  const timer = setTimeout(() => ctrl.abort(), 22000)
   let res
   try {
     res = await fetch(`${DEEPSEEK_BASE()}/chat/completions`, {
@@ -789,13 +932,19 @@ export async function recommend({
   // gather candidates for the original topic, not for the complaint itself.
   const gatheringText = topic ? `${topic} ${text}` : text
   const gathered = await gatherCandidates(gatheringText, { referenceSlug })
-  const candidates = avoid.size ? gathered.filter((c) => !avoid.has(c.slug)) : gathered
+  const candidates = avoid.size
+    ? gathered.candidates.filter((c) => !avoid.has(c.slug))
+    : gathered.candidates
   if (!candidates.length) {
+    const who = gathered.person?.name
     return {
-      reply:
-        "I couldn't find alternative titles for that request. Try widening the genre, country or year.",
+      reply: who
+        ? `I couldn't find any ${who} titles matching that request in this catalog. Try a different genre, or ask for ${who}'s best movies.`
+        : "I couldn't find alternative titles for that request. Try widening the genre, country or year.",
       picks: [],
-      followups: ['Try another genre', 'Something family-friendly', 'Korean thriller'],
+      followups: who
+        ? [`Best of ${who}`, 'Something similar but different', 'Try another genre']
+        : ['Try another genre', 'Something family-friendly', 'Korean thriller'],
       source: 'local',
       candidates: 0,
     }
@@ -815,29 +964,68 @@ export async function recommend({
     (segment) => !segment.filler && segment.type === 'country',
   )
 
-  if (!aiConfigured()) {
-    const local = localRecommend(text, candidates, memory, prefs, { targetName })
+  const coolingDown = Date.now() < aiCooldownUntil
+  if (!aiConfigured() || coolingDown) {
+    const local = localRecommend(text, candidates, memory, prefs, {
+      aiAttempted: coolingDown,
+      targetName,
+    })
     const picks = await hydratePicks(local.picks, candidateMap)
-    return { ...local, picks: polishLocalPicks(picks, text), source: 'local', candidates: candidates.length }
+    return {
+      ...local,
+      picks: polishLocalPicks(picks, text),
+      source: 'local',
+      candidates: candidates.length,
+      aiCooldown: coolingDown,
+    }
   }
 
+  const prompt = buildPrompt({
+    message: text,
+    candidates,
+    memory,
+    prefs,
+    targetName,
+    history,
+    coverage,
+    person: gathered.person,
+  })
   let parsed
-  try {
-    const content = await callModel(
-      buildPrompt({ message: text, candidates, memory, prefs, targetName, history, coverage }),
-    )
-    parsed = parseJsonLoose(content)
-  } catch (err) {
+  let rawContent = ''
+  let lastError = 'AI unavailable'
+  // One retry: free-tier models occasionally answer with prose, truncate, or hit
+  // a transient network blip. The retry hardens the JSON-only instruction.
+  for (let attempt = 0; attempt < 2 && !parsed; attempt += 1) {
+    if (attempt > 0 && Date.now() < aiCooldownUntil) break
+    try {
+      const messages =
+        attempt === 0
+          ? prompt
+          : prompt.map((m) =>
+              m.role === 'system'
+                ? {
+                    ...m,
+                    content: `${m.content}\n\nIMPORTANT: reply with ONLY the JSON object described above. No prose, no markdown fences, no commentary before or after.`,
+                  }
+                : m,
+            )
+      rawContent = await callModel(messages)
+      parsed = parseJsonLoose(rawContent)
+    } catch (err) {
+      lastError = String(err?.message || err)
+      console.log(`[ai] attempt ${attempt + 1} failed: ${lastError} | raw=${rawContent.slice(0, 200)}`)
+    }
+  }
+  if (!parsed) {
     // Fall back gracefully rather than breaking the TV experience.
     const local = localRecommend(text, candidates, memory, prefs, { aiAttempted: true, targetName })
     const picks = await hydratePicks(local.picks, candidateMap)
     return {
       ...local,
-      reply: `${local.reply} Reason: ${err.message.slice(0, 160)}`,
       picks: polishLocalPicks(picks, text),
       source: 'local',
       candidates: candidates.length,
-      aiError: err.message,
+      aiError: lastError,
     }
   }
 

@@ -1,4 +1,5 @@
 import express from 'express'
+import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs'
 import { Readable } from 'node:stream'
@@ -7,18 +8,22 @@ import { fileURLToPath } from 'node:url'
 import {
   catalogMeta,
   cachedDetails,
+  detectQueryFilters,
   enrichItem,
   forYou,
   getDetail,
   getHindiSections,
   getHome,
   getListing,
+  hasCatalogTitle,
   indexStats,
+  matchPersonFilms,
   searchCatalog,
   startCrawl,
   startWarmup,
 } from './catalog.js'
 import { aiMeta, aiConfigured, recommend, similarTo } from './ai.js'
+import { resolvePersonInQuery } from './people.js'
 import { probeStream, startStream, transcodeAvailable } from './player.js'
 import { enrich, tmdbConfigured } from './tmdb.js'
 
@@ -53,6 +58,23 @@ function rateLimit(max, windowMs) {
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
 
+/** The address the TV should open (first private IPv4 address on this PC). */
+function lanUrl() {
+  const port = process.env.PORT || 8787
+  for (const interfaces of Object.values(os.networkInterfaces())) {
+    for (const net of interfaces || []) {
+      if (
+        net.family === 'IPv4' &&
+        !net.internal &&
+        /^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)/.test(net.address)
+      ) {
+        return `http://${net.address}:${port}`
+      }
+    }
+  }
+  return ''
+}
+
 /* ──────────────────────────────── routes ──────────────────────────────── */
 
 app.get('/api/health', (req, res) => {
@@ -65,6 +87,7 @@ app.get('/api/health', (req, res) => {
     index: indexStats(),
     player: { transcode: transcodeAvailable() },
     mode: process.env.VERCEL ? 'vercel' : 'local',
+    lan: { url: process.env.VERCEL ? '' : lanUrl() },
   })
 })
 
@@ -128,7 +151,33 @@ app.get(
   wrap(async (req, res) => {
     const q = String(req.query.q || '').slice(0, 120)
     const data = await searchCatalog(q)
-    res.set('Cache-Control', 'public, max-age=120')
+
+    // CircleFTP search only matches titles. Actor names live in Wikidata, so
+    // merge the person's catalog-verified filmography into the results.
+    let person = null
+    if (q.trim() && !hasCatalogTitle(q)) {
+      person = await resolvePersonInQuery(q).catch(() => null)
+    }
+
+    if (person) {
+      const filters = detectQueryFilters(q)
+      const actorItems = matchPersonFilms(person.films, { ...filters, limit: 60 })
+      // The viewer asked about a person: show their verified credits only.
+      // Mixing in unrelated genre matches made "amir khan sports" look random.
+      data.items = actorItems.slice(0, 90)
+      data.total = actorItems.length
+      data.person = {
+        name: person.name,
+        description: person.description || '',
+        matched: actorItems.length,
+        role: person.role,
+        genres: filters.genres,
+        countries: filters.countries,
+        languages: filters.languages || [],
+      }
+    }
+
+    res.set('Cache-Control', person ? 'private, max-age=300' : 'public, max-age=120')
     res.json(data)
   }),
 )
@@ -250,6 +299,68 @@ app.get(
     const result = await enrich(title, year)
     res.set('Cache-Control', 'public, max-age=3600')
     res.json(result)
+  }),
+)
+
+/* ─────────────────────────── spoken replies (TTS) ─────────────────────────── */
+/* Many TV browsers have no Bengali voice installed, which left the assistant
+ * silent. This proxy produces a Bengali (female) MP3 server-side so the voice
+ * works everywhere, including over HTTPS on Vercel. */
+
+const TTS_CACHE = new Map()
+const TTS_CACHE_MAX = 200
+
+function splitForTts(text, max = 170) {
+  const clean = String(text || '').replace(/\s+/g, ' ').trim()
+  if (clean.length <= max) return clean ? [clean] : []
+  const parts = []
+  let rest = clean
+  while (rest.length > max) {
+    let cut = rest.lastIndexOf(' ', max)
+    if (cut < Math.floor(max * 0.55)) cut = max
+    parts.push(rest.slice(0, cut).trim())
+    rest = rest.slice(cut).trim()
+  }
+  if (rest) parts.push(rest)
+  return parts.filter(Boolean)
+}
+
+app.get(
+  '/api/tts',
+  wrap(async (req, res) => {
+    const text = String(req.query.text || '').slice(0, 900).trim()
+    if (!text) return res.status(400).json({ error: 'text is required' })
+    const lang = req.query.lang === 'en' ? 'en' : 'bn'
+    const key = `${lang}:${text}`
+    const hit = TTS_CACHE.get(key)
+    if (hit && Date.now() - hit.at < 24 * 60 * 60 * 1000) {
+      res.set('Content-Type', 'audio/mpeg')
+      res.set('Cache-Control', 'public, max-age=86400')
+      return res.send(hit.buf)
+    }
+
+    const chunks = splitForTts(text)
+    const buffers = []
+    for (const chunk of chunks) {
+      const url =
+        'https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob' +
+        `&tl=${lang}&q=${encodeURIComponent(chunk)}`
+      const upstream = await fetch(url, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+          Referer: 'https://translate.google.com/',
+        },
+      })
+      if (!upstream.ok) throw new Error(`Speech service returned ${upstream.status}`)
+      buffers.push(Buffer.from(await upstream.arrayBuffer()))
+    }
+    const buf = Buffer.concat(buffers)
+    if (TTS_CACHE.size >= TTS_CACHE_MAX) TTS_CACHE.clear()
+    TTS_CACHE.set(key, { at: Date.now(), buf })
+    res.set('Content-Type', 'audio/mpeg')
+    res.set('Cache-Control', 'public, max-age=86400')
+    res.send(buf)
   }),
 )
 

@@ -79,6 +79,9 @@ export function useVoiceRecognition({ lang = 'en-IN', onFinal }: UseVoiceOptions
           'service-not-allowed': 'Speech service blocked. Use the on-screen keyboard instead.',
           'no-speech': "I didn't hear anything. Try again.",
           network: 'Speech recognition needs a network connection.',
+          'language-not-supported':
+            'This browser cannot understand Bangla speech. Switch “You speak” to English in Settings, or type the request.',
+          'audio-capture': 'No microphone found. Use the keyboard instead.',
           aborted: '',
         }
         const message = messages[code] ?? `Voice error: ${code}. You can type instead.`
@@ -174,11 +177,27 @@ export interface SpeakOptions {
   gender?: VoiceGender
 }
 
-export function speak(text: string, { lang = 'en', gender = 'female' }: SpeakOptions = {}) {
-  if (!text || typeof window === 'undefined' || !('speechSynthesis' in window)) return
+/* Server-side speech is used for Bengali because most TVs have no Bengali
+ * voice installed. It returns a female Bengali MP3, so the assistant actually
+ * talks on every device. English keeps the device's native voice. */
+let currentAudio: HTMLAudioElement | null = null
+let speakToken = 0
+
+function stopAudio() {
+  if (!currentAudio) return
+  try {
+    currentAudio.pause()
+  } catch {
+    /* ignore */
+  }
+  currentAudio.src = ''
+  currentAudio = null
+}
+
+function speakNative(text: string, { lang, gender }: Required<SpeakOptions>) {
+  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return
   try {
     primeVoices()
-    window.speechSynthesis.cancel()
     const utterance = new SpeechSynthesisUtterance(text)
     const voice = pickVoice(lang, gender)
     if (voice) {
@@ -195,7 +214,45 @@ export function speak(text: string, { lang = 'en', gender = 'female' }: SpeakOpt
   }
 }
 
+async function speakFromServer(text: string, token: number, fallback: () => void) {
+  try {
+    const audio = new Audio(`/api/tts?lang=bn&text=${encodeURIComponent(text.slice(0, 900))}`)
+    audio.preload = 'auto'
+    currentAudio = audio
+    audio.onerror = () => {
+      if (token !== speakToken) return
+      stopAudio()
+      fallback()
+    }
+    await audio.play()
+  } catch {
+    if (token !== speakToken) return
+    stopAudio()
+    fallback()
+  }
+}
+
+export function speak(text: string, { lang = 'en', gender = 'female' }: SpeakOptions = {}) {
+  if (!text || typeof window === 'undefined') return
+  const token = ++speakToken
+  stopAudio()
+  try {
+    window.speechSynthesis?.cancel()
+  } catch {
+    /* ignore */
+  }
+
+  if (lang === 'bn') {
+    // Prefer the server voice (always female Bengali); fall back to the device.
+    void speakFromServer(text, token, () => speakNative(text, { lang, gender }))
+    return
+  }
+  speakNative(text, { lang, gender })
+}
+
 export function stopSpeaking() {
+  speakToken += 1
+  stopAudio()
   try {
     window.speechSynthesis?.cancel()
   } catch {

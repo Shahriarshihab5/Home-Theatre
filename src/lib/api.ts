@@ -39,7 +39,21 @@ export const api = {
     getJSON<{ items: CatalogItem[]; hasMore: boolean; nextOffset: number | null }>(
       `/api/list?type=${encodeURIComponent(type)}&slug=${encodeURIComponent(slug)}&offset=${offset}`,
     ),
-  search: (q: string) => getJSON<{ query: string; items: CatalogItem[] }>(`/api/search?q=${encodeURIComponent(q)}`),
+  search: (q: string) =>
+    getJSON<{
+      query: string
+      items: CatalogItem[]
+      total?: number
+      person?: {
+        name: string
+        description: string
+        matched: number
+        role: 'cast' | 'director'
+        genres: string[]
+        countries: string[]
+        languages: string[]
+      }
+    }>(`/api/search?q=${encodeURIComponent(q)}`),
   detail: (slug: string) => getJSON<Detail>(`/api/detail?slug=${encodeURIComponent(slug)}`),
   similar: (slug: string) => getJSON<AiResult>(`/api/similar?slug=${encodeURIComponent(slug)}`),
   recommend: (body: {

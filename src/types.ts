@@ -37,6 +37,8 @@ export interface Detail extends CatalogItem {
 
 export type VoiceLang = 'en' | 'bn'
 export type VoiceGender = 'female' | 'male'
+/** Language spoken into the microphone. */
+export type ListenLang = 'en' | 'bn'
 
 export interface Prefs {
   preferHindi: boolean
@@ -46,6 +48,8 @@ export interface Prefs {
   voiceLang: VoiceLang
   /** Preferred speech-synthesis voice. */
   voiceGender: VoiceGender
+  /** What you speak into the mic: English or Bengali. */
+  listenLang: ListenLang
 }
 
 export interface RatingEntry {
@@ -160,4 +164,5 @@ export interface HealthInfo {
   ai: { provider: string; model: string; configured: boolean }
   tmdb: { configured: boolean }
   mode: string
+  lan?: { url: string }
 }

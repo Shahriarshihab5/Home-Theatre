@@ -10,9 +10,11 @@ interface AskBarProps {
   onModeChange: (mode: Mode) => void
   onSubmit: (text: string, mode: Mode) => void
   chips?: { label: string; prompt: string }[]
+  /** Language spoken into the mic. */
+  listenLang?: 'en' | 'bn'
 }
 
-export function AskBar({ busy, mode, onModeChange, onSubmit, chips = [] }: AskBarProps) {
+export function AskBar({ busy, mode, onModeChange, onSubmit, chips = [], listenLang = 'en' }: AskBarProps) {
   const [text, setText] = useState('')
   const inputRef = useRef<HTMLInputElement>(null)
 
@@ -24,7 +26,7 @@ export function AskBar({ busy, mode, onModeChange, onSubmit, chips = [] }: AskBa
   }
 
   const voice = useVoiceRecognition({
-    lang: 'en-IN',
+    lang: listenLang === 'bn' ? 'bn-BD' : 'en-IN',
     onFinal: (transcript) => {
       setText(transcript)
       submit(transcript)

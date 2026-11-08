@@ -200,6 +200,7 @@ export function HomePage() {
   const [selected, setSelected] = useState<CatalogItem | null>(null)
   const spokenRef = useRef<string>('')
   const ranSimilar = useRef('')
+  const ranAsk = useRef('')
   const lastQueryRef = useRef('')
   const lastPicksRef = useRef<AiPick[]>([])
   const threadRef = useRef<{ role: 'user' | 'assistant'; text: string }[]>([])
@@ -353,6 +354,16 @@ export function HomePage() {
       .finally(() => setAiBusy(false))
   }, [location.search, navigate])
 
+  // The Search page falls back to the AI via /?ask=... when nothing matches.
+  useEffect(() => {
+    const prompt = new URLSearchParams(location.search).get('ask')
+    if (!prompt || ranAsk.current === prompt) return
+    ranAsk.current = prompt
+    navigate('/', { replace: true })
+    setMode('ask')
+    void ask(prompt)
+  }, [location.search, navigate, ask])
+
   const runSearch = useCallback(async (text: string) => {
     setSearchBusy(true)
     setSearchError(null)
@@ -368,6 +379,14 @@ export function HomePage() {
           text,
         )
       if (result.items.length < 4 && descriptive && text.trim().split(/\s+/).length > 1) {
+        setSearch(null)
+        setMode('ask')
+        await ask(text)
+        return
+      }
+      // A spoken request like "Amir Khan sports movies" is not a title. If the
+      // catalog finds nothing, let the AI resolve it instead of showing 0 hits.
+      if (!result.items.length) {
         setSearch(null)
         setMode('ask')
         await ask(text)
@@ -393,7 +412,7 @@ export function HomePage() {
 
   // Voice feedback: after results are shown the viewer can simply talk.
   const feedbackVoice = useVoiceRecognition({
-    lang: 'en-IN',
+    lang: memory.prefs.listenLang === 'bn' ? 'bn-BD' : 'en-IN',
     onFinal: (transcript) => {
       void ask(transcript)
     },
@@ -530,7 +549,14 @@ export function HomePage() {
           </div>
         </div>
 
-        <AskBar busy={aiBusy || searchBusy} mode={mode} onModeChange={setMode} onSubmit={submit} chips={CHIPS} />
+        <AskBar
+          busy={aiBusy || searchBusy}
+          mode={mode}
+          onModeChange={setMode}
+          onSubmit={submit}
+          chips={CHIPS}
+          listenLang={memory.prefs.listenLang}
+        />
       </section>
 
       {aiBusy ? (
@@ -572,7 +598,12 @@ export function HomePage() {
                     {ai.source === 'ai' ? ai.model || 'AI' : 'local ranking'}
                   </span>
                 </p>
-                <p className="mt-1 max-w-3xl text-[0.98rem] leading-relaxed text-white/85 md:text-[1.05rem]">{ai.reply}</p>
+                <p className="mt-1 max-w-3xl text-[0.98rem] leading-relaxed text-white/85 md:text-[1.05rem]">
+                  {memory.prefs.voiceLang === 'bn' && ai.replyBn ? ai.replyBn : ai.reply}
+                </p>
+                {memory.prefs.voiceLang === 'bn' && ai.replyBn ? (
+                  <p className="mt-1.5 max-w-3xl text-[0.8rem] leading-relaxed text-white/40">{ai.reply}</p>
+                ) : null}
               </div>
             </div>
 

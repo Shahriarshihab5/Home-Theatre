@@ -19,6 +19,7 @@ import {
 
 const NAV = [
   { to: '/', label: 'Home', Icon: HomeIcon },
+  { to: '/search', label: 'Search', Icon: SearchIcon },
   { to: '/hindi', label: 'Hindi', Icon: FilmIcon },
   { to: '/history', label: 'History', Icon: HistoryIcon },
   { to: '/watchlist', label: 'Wishlist', Icon: BookmarkIcon },
@@ -46,14 +47,6 @@ export function NavBar({ onSettings, onProfiles }: { onSettings: () => void; onP
   useEffect(() => {
     api.health().then(setHealth).catch(() => setHealth(null))
   }, [])
-
-  const focusSearch = () => {
-    if (location.pathname !== '/') navigate('/')
-    window.setTimeout(() => {
-      const input = document.getElementById('ask-input') as HTMLInputElement | null
-      input?.focus()
-    }, 140)
-  }
 
   return (
     <header className="sticky top-0 z-40 border-b border-white/10 bg-ink">
@@ -97,16 +90,6 @@ export function NavBar({ onSettings, onProfiles }: { onSettings: () => void; onP
               </button>
             )
           })}
-
-          <button
-            type="button"
-            data-nav
-            onClick={focusSearch}
-            className="flex items-center gap-1.5 rounded-xl px-3 py-2 text-sm font-bold text-white/55 transition hover:bg-white/[0.07] hover:text-white"
-          >
-            <SearchIcon width={16} height={16} />
-            <span className="hidden sm:inline">Search</span>
-          </button>
         </nav>
 
         <div className="ml-auto flex items-center gap-2">
