@@ -1014,6 +1014,14 @@ const INTENT_GENRES = new Set([
   'sport', 'thriller', 'war', 'western',
 ])
 
+/** Household names in Bengali script, so TTS pronounces them correctly. */
+const BENGALI_NAMES = {
+  shihab: 'শিহাব',
+  olive: 'অলিভ',
+  shahnaj: 'শাহনাজ',
+  everyone: 'সবাই',
+}
+
 function buildIntentPrompt({ message, memory, prefs, targetName, history = [], topic = '' }) {
   const wantsBanglaVoice = prefs?.voiceLang === 'bn'
   const conversation = (Array.isArray(history) ? history : [])
@@ -1062,7 +1070,11 @@ FIELDS
 - wantsSeries: true only when the viewer asks for a web series, TV show, season or episodes.
 - mood: 2-5 words, e.g. "tense revenge thriller".
 - reply: 1-2 warm, TV-friendly sentences that acknowledge the request and mention the theme, country or mood. Do NOT name titles. Do NOT promise availability.
-${wantsBanglaVoice ? '- replyBn: the same acknowledgement in conversational Bengali script (বাংলা), 1-2 short sentences. No transliteration and no English sentences.' : ''}
+${wantsBanglaVoice ? '- replyBn: the same acknowledgement in conversational Bengali script (বাংলা), 1-2 short sentences. No transliteration and no English sentences.' : ''}${
+    wantsBanglaVoice && targetName && BENGALI_NAMES[String(targetName).toLowerCase()]
+      ? `\n- In replyBn write the viewer's name exactly as "${BENGALI_NAMES[String(targetName).toLowerCase()]}".`
+      : ''
+  }
 
 RULES
 - An explicit country or language in the request overrides any saved Hindi preference.
