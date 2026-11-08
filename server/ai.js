@@ -46,17 +46,88 @@ const DEEPSEEK_BASE = () => (process.env.DEEPSEEK_BASE_URL || 'https://api.deeps
 const DEEPSEEK_MODEL = () => process.env.DEEPSEEK_MODEL || 'deepseek-flash'
 const DEEPSEEK_THINKING = () => (process.env.DEEPSEEK_THINKING || 'disabled').toLowerCase()
 
+// Groq: free plan, no credit card. 30 req/min, 1000 req/day, 8k tokens/min.
+const GROQ_KEY = () => process.env.GROQ_API_KEY || ''
+const GROQ_BASE = () => (process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1').replace(/\/$/, '')
+const GROQ_MODEL = () => process.env.GROQ_MODEL || 'openai/gpt-oss-20b'
+
+// OpenRouter: free `:free` models, 50 requests/day without any purchase.
+const OPENROUTER_KEY = () => process.env.OPENROUTER_API_KEY || ''
+const OPENROUTER_BASE = () =>
+  (process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1').replace(/\/$/, '')
+const OPENROUTER_MODEL = () =>
+  process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-ultra-550b-a55b:free'
+
 function stripModelsPrefix(model) {
   return String(model || '').replace(/^models\//, '')
 }
 
 /**
- * Gemini occasionally stalls for 20+ seconds on a home connection. When that
- * happens, skip the API for a short while so the TV answers immediately with
- * the local ranker instead of making the viewer wait again.
+ * Providers that speak the OpenAI chat-completions protocol. Gemini has its
+ * own native call. Order matters: free options first, paid DeepSeek last.
  */
-let aiCooldownUntil = 0
+const PROVIDERS = {
+  gemini: {
+    id: 'gemini',
+    key: GEMINI_KEY,
+    base: GEMINI_BASE,
+    model: GEMINI_MODEL,
+  },
+  groq: {
+    id: 'groq',
+    key: GROQ_KEY,
+    base: GROQ_BASE,
+    model: GROQ_MODEL,
+    headers: () => ({}),
+    // gpt-oss is a reasoning model; "low" keeps replies fast and inside the
+    // free plan's 8k-tokens-per-minute budget.
+    extra: () => (GROQ_MODEL().includes('gpt-oss') ? { reasoning_effort: 'low' } : {}),
+  },
+  openrouter: {
+    id: 'openrouter',
+    key: OPENROUTER_KEY,
+    base: OPENROUTER_BASE,
+    model: OPENROUTER_MODEL,
+    headers: () => ({
+      'HTTP-Referer': process.env.PUBLIC_APP_URL || 'https://hometheatre-eight.vercel.app',
+      'X-Title': 'Home Movie Theatre',
+    }),
+    extra: () => ({}),
+  },
+  deepseek: {
+    id: 'deepseek',
+    key: DEEPSEEK_KEY,
+    base: DEEPSEEK_BASE,
+    model: DEEPSEEK_MODEL,
+    headers: () => ({}),
+    extra: () => (DEEPSEEK_THINKING() !== 'enabled' ? { thinking: { type: 'disabled' } } : {}),
+  },
+}
+
+/** Configured providers, in the order that will be tried. */
+function providerChain() {
+  const forced = (process.env.AI_PROVIDER || 'auto').toLowerCase()
+  if (forced === 'local') return []
+  if (forced !== 'auto') {
+    const only = PROVIDERS[forced]
+    return only && only.key() ? [only] : []
+  }
+  return [PROVIDERS.gemini, PROVIDERS.groq, PROVIDERS.openrouter, PROVIDERS.deepseek].filter((p) =>
+    p.key(),
+  )
+}
+
+/**
+ * Gemini occasionally stalls for 20+ seconds on a home connection. When that
+ * happens, skip that provider for a short while so the TV answers immediately
+ * with another provider or the local ranker instead of waiting again.
+ */
 const AI_COOLDOWN_MS = 60000
+const providerCooldownUntil = new Map()
+
+function isCoolingDown(provider) {
+  return Date.now() < (providerCooldownUntil.get(provider) || 0)
+}
 
 function isTransientError(error) {
   if (!error) return false
@@ -75,25 +146,22 @@ function isNetworkFailure(error) {
   )
 }
 
-function openAiCooldown(error) {
-  aiCooldownUntil = Date.now() + AI_COOLDOWN_MS
+function openAiCooldown(provider, error) {
+  providerCooldownUntil.set(provider, Date.now() + AI_COOLDOWN_MS)
   console.log(
-    `[ai] circuit open for ${Math.round(AI_COOLDOWN_MS / 1000)}s after: ${String(error?.message || error).slice(0, 120)}`,
+    `[ai] ${provider} circuit open for ${Math.round(AI_COOLDOWN_MS / 1000)}s after: ${String(
+      error?.message || error,
+    ).slice(0, 120)}`,
   )
 }
 
-/** Which provider will actually be used on the next call. */
+/** The provider that will be tried first (for health/settings display). */
 export function activeProvider() {
-  const forced = (process.env.AI_PROVIDER || 'auto').toLowerCase()
-  if (forced === 'gemini' && GEMINI_KEY()) return 'gemini'
-  if (forced === 'deepseek' && DEEPSEEK_KEY()) return 'deepseek'
-  if (forced === 'local') return 'local'
-  if (GEMINI_KEY()) return 'gemini'
-  if (DEEPSEEK_KEY()) return 'deepseek'
-  return 'local'
+  const first = providerChain()[0]
+  return first ? first.id : 'local'
 }
 
-export const aiConfigured = () => activeProvider() !== 'local'
+export const aiConfigured = () => providerChain().length > 0
 
 /* ───────────────────────── candidate gathering ───────────────────────── */
 
@@ -600,7 +668,10 @@ async function callGeminiOnce(model, system, user, { withThinking }) {
   }
 
   const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), 9000)
+  // When a free alternative is configured, do not let Gemini eat the whole
+  // latency budget: 7s leaves room for Groq/OpenRouter to answer.
+  const timeoutMs = GROQ_KEY() || OPENROUTER_KEY() ? 7000 : 9000
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
   const startedAt = Date.now()
   let res
   try {
@@ -670,13 +741,13 @@ async function callGemini(system, user) {
 
   try {
     const result = await callGeminiModel(primary, system, user)
-    aiCooldownUntil = 0
+    providerCooldownUntil.delete('gemini')
     return result
   } catch (primaryError) {
     // A timeout / DNS / socket failure is not model-specific. Swapping to the
     // fallback would just wait another timeout, so stop immediately.
     if (isNetworkFailure(primaryError)) {
-      openAiCooldown(primaryError)
+      openAiCooldown('gemini', primaryError)
       throw primaryError
     }
 
@@ -689,43 +760,42 @@ async function callGemini(system, user) {
     if (fallback && fallback !== primary && retriable) {
       try {
         const result = await callGeminiModel(fallback, system, user)
-        aiCooldownUntil = 0
+        providerCooldownUntil.delete('gemini')
         return result
       } catch (fallbackError) {
-        if (isTransientError(fallbackError)) openAiCooldown(fallbackError)
+        if (isTransientError(fallbackError)) openAiCooldown('gemini', fallbackError)
         throw new Error(`${primaryError.message} → fallback ${fallbackError.message}`)
       }
     }
 
-    if (isTransientError(primaryError)) openAiCooldown(primaryError)
+    if (isTransientError(primaryError)) openAiCooldown('gemini', primaryError)
     throw primaryError
   }
 }
 
-/* ── DeepSeek (optional) ────────────────────────────────────────────────── */
+/* ── OpenAI-compatible providers (Groq, OpenRouter, DeepSeek) ───────────── */
 
-async function callDeepSeek(messages) {
-  if (!DEEPSEEK_KEY()) throw new Error('DEEPSEEK_API_KEY is not configured')
-
+async function callOpenAiCompatible(provider, messages) {
   const body = {
-    model: DEEPSEEK_MODEL(),
+    model: provider.model(),
     messages,
     temperature: 0.45,
-    max_tokens: 1800,
+    max_tokens: 1600,
     response_format: { type: 'json_object' },
     stream: false,
+    ...(provider.extra ? provider.extra() : {}),
   }
-  if (DEEPSEEK_THINKING() !== 'enabled') body.thinking = { type: 'disabled' }
 
   const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), 22000)
+  const timer = setTimeout(() => ctrl.abort(), 9000)
   let res
   try {
-    res = await fetch(`${DEEPSEEK_BASE()}/chat/completions`, {
+    res = await fetch(`${provider.base()}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${DEEPSEEK_KEY()}`,
+        Authorization: `Bearer ${provider.key()}`,
+        ...(provider.headers ? provider.headers() : {}),
       },
       body: JSON.stringify(body),
       signal: ctrl.signal,
@@ -743,28 +813,51 @@ async function callDeepSeek(messages) {
     } catch {
       /* raw text is fine */
     }
-    throw new Error(`DeepSeek ${res.status}: ${detail}`)
+    const error = new Error(`${provider.id} ${res.status}: ${detail}`)
+    error.status = res.status
+    throw error
   }
 
   const data = JSON.parse(text)
   const content = data?.choices?.[0]?.message?.content
-  if (!content) throw new Error('DeepSeek returned an empty response')
+  if (!content) throw new Error(`${provider.id} returned an empty response`)
   return content
 }
 
 /* ── dispatcher ─────────────────────────────────────────────────────────── */
 
 async function callModel(messages) {
-  const provider = activeProvider()
-  if (provider === 'local') throw new Error('No AI key configured')
+  const chain = providerChain()
+  if (!chain.length) throw new Error('No AI key configured')
 
-  if (provider === 'gemini') {
-    const system = messages.find((m) => m.role === 'system')?.content || ''
-    const user = messages.find((m) => m.role === 'user')?.content || ''
-    return callGemini(system, user)
+  let lastError = null
+  for (const provider of chain) {
+    if (isCoolingDown(provider.id)) continue
+    try {
+      let content
+      if (provider.id === 'gemini') {
+        const system = messages.find((m) => m.role === 'system')?.content || ''
+        const user = messages.find((m) => m.role === 'user')?.content || ''
+        content = await callGemini(system, user)
+      } else {
+        content = await callOpenAiCompatible(provider, messages)
+      }
+      providerCooldownUntil.delete(provider.id)
+      return { content, provider: provider.id, model: provider.model() }
+    } catch (err) {
+      lastError = err
+      console.log(
+        `[ai] ${provider.id} unavailable: ${String(err?.message || err).slice(0, 160)}`,
+      )
+      if (isTransientError(err) && !isCoolingDown(provider.id)) {
+        openAiCooldown(provider.id, err)
+      }
+      // Try the next configured provider. Free alternatives live on different
+      // hosts, so a Google outage does not take the whole assistant down.
+    }
   }
 
-  return callDeepSeek(messages)
+  throw lastError || new Error('No AI provider available')
 }
 
 function parseJsonLoose(content) {
@@ -964,8 +1057,9 @@ export async function recommend({
     (segment) => !segment.filler && segment.type === 'country',
   )
 
-  const coolingDown = Date.now() < aiCooldownUntil
-  if (!aiConfigured() || coolingDown) {
+  const usableProviders = providerChain().filter((provider) => !isCoolingDown(provider.id))
+  const coolingDown = aiConfigured() && usableProviders.length === 0
+  if (!aiConfigured() || !usableProviders.length) {
     const local = localRecommend(text, candidates, memory, prefs, {
       aiAttempted: coolingDown,
       targetName,
@@ -993,10 +1087,16 @@ export async function recommend({
   let parsed
   let rawContent = ''
   let lastError = 'AI unavailable'
+  let answeredBy = null
   // One retry: free-tier models occasionally answer with prose, truncate, or hit
   // a transient network blip. The retry hardens the JSON-only instruction.
   for (let attempt = 0; attempt < 2 && !parsed; attempt += 1) {
-    if (attempt > 0 && Date.now() < aiCooldownUntil) break
+    if (
+      attempt > 0 &&
+      !providerChain().some((provider) => !isCoolingDown(provider.id))
+    ) {
+      break
+    }
     try {
       const messages =
         attempt === 0
@@ -1009,7 +1109,8 @@ export async function recommend({
                   }
                 : m,
             )
-      rawContent = await callModel(messages)
+      answeredBy = await callModel(messages)
+      rawContent = answeredBy.content
       parsed = parseJsonLoose(rawContent)
     } catch (err) {
       lastError = String(err?.message || err)
@@ -1111,8 +1212,8 @@ export async function recommend({
     picks: hydrated,
     followups: Array.isArray(parsed.followups) ? parsed.followups.slice(0, 4).map(String) : [],
     source: 'ai',
-    model: aiMeta().model,
-    provider: activeProvider(),
+    model: answeredBy?.model || aiMeta().model,
+    provider: answeredBy?.provider || activeProvider(),
     targetName: targetName || undefined,
     candidates: candidates.length,
     avgRating,
@@ -1132,11 +1233,17 @@ export async function similarTo(slug) {
 }
 
 export const aiMeta = () => {
-  const provider = activeProvider()
+  const chain = providerChain()
+  const primary = chain[0] || null
   return {
-    provider,
-    model: provider === 'gemini' ? GEMINI_MODEL() : provider === 'deepseek' ? DEEPSEEK_MODEL() : '',
-    configured: provider !== 'local',
-    baseUrl: provider === 'gemini' ? GEMINI_BASE() : provider === 'deepseek' ? DEEPSEEK_BASE() : '',
+    provider: primary ? primary.id : 'local',
+    model: primary ? primary.model() : '',
+    configured: chain.length > 0,
+    baseUrl: primary ? primary.base() : '',
+    // Free options are listed so Settings can show what will answer next.
+    providers: chain.map((provider) => provider.id),
+    coolingDown: chain
+      .filter((provider) => isCoolingDown(provider.id))
+      .map((provider) => provider.id),
   }
 }
