@@ -75,6 +75,50 @@ const NON_PERSON_WORDS = new Set(
   ).split(/\s+/),
 )
 
+// Feedback chatter ("no brother I don't like these") must never be mistaken for
+// a person's name, or the actor lookup hijacks the whole answer.
+const CHATTER_WORDS = new Set(
+  (
+    'brother brothers sis sister bro mom mum mother father dad uncle aunt cousin friend friends ' +
+    'like liked likes dislike dislikes hate hated love loved boring bored bad worse worst ' +
+    'ok okay yes yeah nope nah not dont doesnt didnt didnt do does did done ' +
+    'them they we us you your mine another other different same else ' +
+    'more less again update change next skip wait hold stop start'
+  ).split(/\s+/),
+)
+
+/** Edit distance small enough to survive a one- or two-letter misspelling. */
+function closeWord(a, b) {
+  if (a === b) return true
+  if (Math.abs(a.length - b.length) > 2) return false
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index)
+  for (let i = 1; i <= a.length; i += 1) {
+    const current = [i]
+    for (let j = 1; j <= b.length; j += 1) {
+      current[j] = Math.min(
+        previous[j] + 1,
+        current[j - 1] + 1,
+        previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+      )
+    }
+    previous = current
+  }
+  return previous[b.length] <= 2
+}
+
+/**
+ * A resolved person must share a real name word with the query. Multi-word
+ * phrases like "brother do like" would otherwise match a random actor through
+ * Wikipedia's fuzzy search.
+ */
+function sharesName(queryKey, label) {
+  const wanted = queryKey.split(' ').filter((token) => token.length >= 3)
+  if (wanted.length < 2) return true
+  const known = titleKey(label).split(' ').filter(Boolean)
+  if (!known.length) return false
+  return wanted.some((token) => known.some((word) => closeWord(token, word)))
+}
+
 /**
  * Pull the most likely person name out of a spoken request.
  * Returns null when the request is just a genre/country/mood.
@@ -97,6 +141,7 @@ export function extractPersonName(message) {
     .filter((word) => !INTENT_WORDS.has(word))
     .filter((word) => !GENRE_WORDS.has(word))
     .filter((word) => !COUNTRY_WORDS.has(word))
+    .filter((word) => !CHATTER_WORDS.has(word))
 
   if (!tokens.length || tokens.length > 4) return null
   if (tokens.some((token) => /\d/.test(token))) return null
@@ -331,7 +376,8 @@ export async function resolvePerson(name) {
     ]
 
     // Primary: an actor/director Wikidata already ranks for this spelling.
-    for (const candidate of ordered.slice(0, 2)) {
+    for (const candidate of ordered.slice(0, 4)) {
+      if (!sharesName(key, candidate.label)) continue
       try {
         const person = await loadPerson(candidate.id, candidate.label, candidate.description)
         if (person && person.films.length) return remember(key, person)
@@ -345,8 +391,9 @@ export async function resolvePerson(name) {
     if (qids === null) {
       networkFailed = true
     }
-    for (const qid of (qids || []).slice(0, 2)) {
+    for (const qid of (qids || []).slice(0, 3)) {
       const meta = await entityLabel(qid)
+      if (!sharesName(key, meta.name || '')) continue
       try {
         const person = await loadPerson(qid, meta.name || query, meta.description)
         if (person && person.films.length >= 2) return remember(key, person)

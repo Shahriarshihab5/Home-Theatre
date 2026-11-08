@@ -21,6 +21,7 @@ import {
   matchPersonFilms,
   peekDetail,
   searchCatalog,
+  titleKey,
 } from './catalog.js'
 import { resolvePersonInQuery } from './people.js'
 
@@ -1346,7 +1347,15 @@ async function hydratePicks(picks, candidateMap, { referenceSlug } = {}) {
       }
     }),
   )
-  return hydrated
+  // The same film can exist under two CircleFTP slugs. Show it once.
+  const seenTitles = new Set()
+  return hydrated.filter((pick) => {
+    const key = titleKey(pick.title)
+    if (!key) return true
+    if (seenTitles.has(key)) return false
+    seenTitles.add(key)
+    return true
+  })
 }
 
 function isKoreanPick(pick) {
@@ -1440,6 +1449,13 @@ export async function recommend({
   if (!text) throw Object.assign(new Error('Message is required'), { status: 400 })
 
   const avoid = new Set((Array.isArray(avoidSlugs) ? avoidSlugs : []).map((s) => String(s)))
+  // The same film can sit under two CircleFTP slugs, so remember the titles of
+  // everything already suggested and keep those out too.
+  const avoidTitleKeys = new Set()
+  for (const slug of avoid) {
+    const title = peekDetail(slug)?.title || indexEntry(slug)?.title
+    if (title) avoidTitleKeys.add(titleKey(title))
+  }
   // When the viewer is reacting to previous picks ("no brother, not these"),
   // gather candidates for the original topic, not for the complaint itself.
   const baseText = topic ? `${topic} ${text}` : text
@@ -1483,9 +1499,10 @@ export async function recommend({
     person,
     explicit: matchSegments(baseText),
   })
-  const candidates = avoid.size
-    ? gathered.candidates.filter((c) => !avoid.has(c.slug))
-    : gathered.candidates
+  const candidates = gathered.candidates.filter(
+    (candidate) =>
+      !avoid.has(candidate.slug) && !avoidTitleKeys.has(titleKey(candidate.title)),
+  )
   if (!candidates.length) {
     const who = gathered.person?.name
     return {
@@ -1522,7 +1539,7 @@ export async function recommend({
       targetName,
       intent,
     })
-    const picks = await hydratePicks(local.picks, candidateMap)
+    const picks = await hydratePicks(local.picks, candidateMap, { referenceSlug })
     return {
       ...local,
       picks: applyQualityFloor(polishLocalPicks(picks, gatheringText)),
@@ -1538,7 +1555,7 @@ export async function recommend({
   // nothing on screen can be invented.
   if (mode === 'intent' && intent) {
     const local = localRecommend(text, candidates, memory, prefs, { targetName, intent })
-    const picks = await hydratePicks(local.picks, candidateMap)
+    const picks = await hydratePicks(local.picks, candidateMap, { referenceSlug })
     const polished = applyQualityFloor(polishLocalPicks(picks, gatheringText))
     const reply = composeIntentReply({ intent, picks: polished, targetName })
     const replyBn =
